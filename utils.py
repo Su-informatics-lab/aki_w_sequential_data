@@ -11,14 +11,37 @@ from itertools import starmap
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
 
 
-def is_cols_in_df(df, cols):
-    """
-    Check if all columns in `cols` are present in DataFrame `df`.
-    Returns a tuple (True, []) if all are present, or (False, missing_cols).
-    """
-    missing = [col for col in cols if col not in df.columns]
-    return (len(missing) == 0, missing)
+def join_list_without_repeat(*lists: List[List[Any]]) -> List[Any]:
+    """Join multiple lists in sequence without repeating
 
+    Returns:
+        List[Any]: Combined list.
+    """
+
+    final = None
+    final_set = set()
+    for alist in lists:
+        if final is None:
+            final = copy.copy(alist)
+        else:
+            final = final + [item for item in alist if item not in final_set]
+        final_set = set(final)
+    return final
+
+
+def is_cols_in_df(df: pd.DataFrame, cols: List[str]) -> bool:
+    """
+    Args:
+        df:
+        cols:
+
+    Returns:
+        bool
+    """
+    for col in cols:
+        if col not in list(df.columns):
+            return False, col
+    return True, None
 
 
 class BaseDFDataset(torch.utils.data.Dataset):
