@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import wandb
 import torch.nn.functional as F
+import json
 
 # Import your ForecastDFDataset from utils.
 from utils import ForecastDFDataset
@@ -19,6 +20,31 @@ from utils import ForecastDFDataset
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
 
 # --- Helper Functions ---
+
+# Fix for numpy types not being JSON serializable
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+# Override the json.dumps in transformers
+import transformers.configuration_utils
+original_to_json_string = transformers.configuration_utils.PretrainedConfig.to_json_string
+
+def patched_to_json_string(self, use_diff=True):
+    """Override to_json_string to use our custom encoder"""
+    config_dict = self.to_dict()
+    if use_diff:
+        config_dict = self.filter_config_diff(config_dict)
+    return json.dumps(config_dict, indent=2, sort_keys=True, cls=NumpyEncoder) + "\n"
+
+# Apply the patch
+transformers.configuration_utils.PretrainedConfig.to_json_string = patched_to_json_string
 
 def pool_minute(df, pool_window=60):
     """
@@ -119,11 +145,12 @@ def compute_metrics(eval_pred):
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
+    # Convert any numpy types to Python native types to ensure JSON serializability
     return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1)
     }
 
 # --- Custom Trainer Subclass ---
@@ -281,6 +308,15 @@ def main(args):
         num_hidden_layers=args.num_hidden_layers,
         num_attention_heads=args.num_attention_heads,
     )
+
+    # Convert any numpy values in config to Python native types
+    for key, value in config.__dict__.items():
+        if isinstance(value, (np.integer, np.floating, np.ndarray)):
+            if isinstance(value, np.ndarray):
+                config.__dict__[key] = value.tolist()
+            else:
+                config.__dict__[key] = value.item()
+
     model = PatchTSTForClassification(config)
 
     training_args = TrainingArguments(
@@ -294,7 +330,7 @@ def main(args):
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="loss",  # Changed from f1 to loss since we need to ensure metrics are calculated properly first
+        metric_for_best_model="loss",  # Use loss initially, can switch to f1 once metrics are confirmed working
         report_to=["wandb"],
     )
 
