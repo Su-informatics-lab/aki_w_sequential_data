@@ -8,7 +8,16 @@ import torch
 
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
 
-    
+
+def is_cols_in_df(df, cols):
+    """
+    Check if all columns in `cols` are present in DataFrame `df`.
+    Returns a tuple (True, []) if all are present, or (False, missing_cols).
+    """
+    missing = [col for col in cols if col not in df.columns]
+    return (len(missing) == 0, missing)
+
+
 
 class BaseDFDataset(torch.utils.data.Dataset):
     """Base dataset for time series models built upon a pandas dataframe
