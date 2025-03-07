@@ -107,11 +107,28 @@ def collate_patient_batches(batch):
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove 'labels' from inputs and compute loss manually.
-        labels = inputs.pop("labels")
+        # Extract the target column values from future_values to use as labels
+        # The first column of future_values is 'Acute_kidney_injury' based on combined_x_cols
+        future_values = inputs.get("future_values")
+
+        # Take the first time step from future_values (index 0) and then take the column that corresponds to AKI
+        # Find the index of 'Acute_kidney_injury' in x_cols
+        # This is based on the log showing 'Acute_kidney_injury' in the list of input columns
+        aki_idx = 23  # Based on the position in combined_x_cols
+
+        # Extract the labels - taking the first prediction step and the AKI column
+        if future_values.size(1) > 0:  # Check if future_values has at least one time step
+            labels = future_values[:, 0, aki_idx].long()  # Convert to long for classification
+        else:
+            # If there are no future values (edge case), use zeros as labels
+            labels = torch.zeros(future_values.size(0), dtype=torch.long, device=future_values.device)
+
+        # Forward pass
         outputs = model(**inputs)
-        # Compute cross-entropy loss using prediction_logits.
+
+        # Compute cross-entropy loss using prediction_logits
         loss = F.cross_entropy(outputs.prediction_logits, labels)
+
         return (loss, outputs) if return_outputs else loss
 
 # --- Main function ---
@@ -206,7 +223,7 @@ def main(args):
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
-        num_input_channels=len(combined_x_cols),  # Expecting 27 channels in your case.
+        num_input_channels=len(combined_x_cols),  # Total number of input channels
         context_length=history_length,
         prediction_length=1,
         num_targets=2,  # binary classification: 0 and 1
@@ -249,15 +266,6 @@ def main(args):
 
     trainer.train()
     trainer.evaluate()
-
-# --- Custom Trainer subclass ---
-class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove 'labels' from inputs and compute loss manually.
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        loss = F.cross_entropy(outputs.prediction_logits, labels)
-        return (loss, outputs) if return_outputs else loss
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
