@@ -28,6 +28,16 @@ from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, Tra
 
 # --- Helper Functions ---
 
+
+def is_cols_in_df(df, cols):
+    """
+    Check if all columns in `cols` are present in DataFrame `df`.
+    Returns a tuple (True, []) if all are present, or (False, missing_cols).
+    """
+    missing = [col for col in cols if col not in df.columns]
+    return (len(missing) == 0, missing)
+
+
 def pool_minute(df, pool_window=60):
     """
     Given a patient's DataFrame (each row is one second, columns are measures),
