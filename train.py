@@ -34,7 +34,7 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only the observable signals are used as input to PatchTST)     |
+|  (Only the observable signals (26 channels) are used as input)   |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
@@ -204,13 +204,13 @@ class ClassificationDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Look for patient ID in "id" or "ID"
+        # Try to get patient ID from key "id" first, then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
         elif "ID" in example:
             patient_id = example["ID"]
-        if patient_id is None:
+        else:
             raise KeyError("No patient ID found in example.")
         if isinstance(patient_id, (tuple, list)):
             patient_id = str(patient_id[0]).strip()
@@ -219,6 +219,8 @@ class ClassificationDataset(Dataset):
         if patient_id not in self.label_mapping:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
+        # (Optional) Uncomment the next line to debug a sample:
+        # print(f"Example {idx} for patient {patient_id} with label {example['labels']}")
         return example
 
 # --- Custom Trainer Subclass ---
@@ -302,7 +304,7 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine observable features: exclude ID, target, time_idx.
+    # Determine observable features: exclude ID, target, and time_idx.
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
