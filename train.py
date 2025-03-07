@@ -1,4 +1,60 @@
 #!/usr/bin/env python
+"""
+PatchTST Classification for AKI Prediction
+
+Overall Process:
++--------------------------------------------------------------+
+|                      Raw CSV Files                           |
+|  Each patient file contains a time series with columns:      |
+|  Timestamp, Monitoring Signals (26 channels), AKI label      |
++--------------------------------------------------------------+
+              |
+              | (Preprocessing: For each CSV, create a fixed-length
+              |  window via pooling or truncation; add columns "ID",
+              |  "time_idx", and the AKI label)
+              v
++--------------------------------------------------------------+
+|         Combined Preprocessed DataFrame (via Parquet)        |
+| Columns:                                                     |
+|   ID, Acute_kidney_injury, time_idx, F1, F2, ..., F26          |
++--------------------------------------------------------------+
+              |
+              | (Split by patient ID into train and validation sets)
+              v
++--------------------------------------------------------------+
+|      ForecastDFDataset (from tsfm_public.toolkit.dataset)      |
+|  Uses:                                                         |
+|    - id_columns = ["ID"]                                       |
+|    - timestamp_column = "time_idx"                             |
+|    - target_columns = observable_columns = [F1, F2, ..., F26]  |
+|  It extracts sliding windows from each patient's data.       |
++--------------------------------------------------------------+
+              |
+              | (Wrap with ClassificationDataset to add static label)
+              v
++--------------------------------------------------------------+
+|       ClassificationDataset (Custom Dataset Wrapper)         |
+|  Each example is a dict containing:                          |
+|    - past_values: tensor of shape [context_length, 26]         |
+|    - labels: scalar AKI label                                  |
+|    - other metadata (timestamp, id, etc.)                      |
++--------------------------------------------------------------+
+              |
+              | (DataLoader batches examples)
+              v
++--------------------------------------------------------------+
+|            PatchTST For Classification Model                 |
+|  Input: [batch, context_length, 26] observable channels         |
+|  Head: Classification head (using last hidden state)           |
++--------------------------------------------------------------+
+              |
+              | (Loss computed using provided "labels")
+              v
++--------------------------------------------------------------+
+|          Training via CustomTrainer (with Early Stopping)      |
++--------------------------------------------------------------+
+"""
+
 import os
 import argparse
 import pandas as pd
@@ -14,7 +70,7 @@ import torch.nn.functional as F
 import json
 from sklearn.metrics import roc_auc_score
 
-# Import your ForecastDFDataset from utils.
+# Import ForecastDFDataset from the IBM tsfm package.
 from tsfm_public.toolkit.dataset import ForecastDFDataset
 
 # Import PatchTST classes and EarlyStoppingCallback from Hugging Face Transformers.
@@ -28,9 +84,7 @@ from transformers import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 
-# --- Helper Functions ---
-
-# Patch PretrainedConfig's to_dict for JSON serialization.
+# --- Patch PretrainedConfig to enable JSON serialization of numpy types.
 original_to_dict = PretrainedConfig.to_dict
 def patched_to_dict(self):
     output = original_to_dict(self)
@@ -49,8 +103,7 @@ def pool_minute(df, pool_window=60):
     Pool over non-overlapping windows of size pool_window using average (ignoring NaNs).
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
-    feature_cols = [col for col in df.columns
-                    if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
+    feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
     n = len(df)
     num_windows = int(np.ceil(n / pool_window))
@@ -86,42 +139,27 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
-class OnTheFlyForecastDFDataset(Dataset):
-    def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
-        """
-        file_list: list of CSV file paths.
-        label_dict: dict mapping patient ID -> AKI label.
-        process_mode: "pool", "truncate", or "none".
-        """
-        self.file_list = file_list
-        self.label_dict = label_dict
-        self.process_mode = process_mode
-        self.pool_window = pool_window
-        self.fixed_length = fixed_length
+# --- Custom wrapper dataset for classification ---
+class ClassificationDataset(Dataset):
+    """
+    A wrapper for ForecastDFDataset that adds a static label "labels" to each example.
+    Assumes that the underlying ForecastDFDataset returns a dictionary with a key "id" (a tuple)
+    and that the static label for each patient can be found in label_mapping.
+    """
+    def __init__(self, base_dataset, label_mapping):
+        self.base_dataset = base_dataset
+        self.label_mapping = label_mapping
 
     def __len__(self):
-        return len(self.file_list)
+        return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        csv_path = self.file_list[idx]
-        fname = os.path.basename(csv_path)
-        patient_id = fname.split('_')[0]
-        df = pd.read_csv(csv_path)
-        df["time_idx"] = range(len(df))
-        df["ID"] = patient_id
-        df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, 0))
-        if self.process_mode == "truncate":
-            df = truncate_pad_series(df, fixed_length=self.fixed_length)
-        elif self.process_mode == "pool":
-            df = pool_minute(df, pool_window=self.pool_window)
-        df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
-        return df
-
-def collate_patient_batches(batch):
-    """
-    Collate a list of processed patient DataFrames into one DataFrame.
-    """
-    return pd.concat(batch, ignore_index=True)
+        example = self.base_dataset[idx]
+        # Assume that "id" is a tuple, so take its first element as patient_id.
+        patient_id = example["id"][0] if isinstance(example["id"], (tuple, list)) else example["id"]
+        # Attach the static AKI label.
+        example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
+        return example
 
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
@@ -130,18 +168,9 @@ class CustomTrainer(Trainer):
         self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Here, we assume the dataset returns "past_values" with shape [B, L, C]
-        # where C = combined channels (27 = target + 26 observable).
-        # We want to strip the target (assumed at index 0) from the input before feeding to the model.
-        full_input = inputs["past_values"]  # shape: [B, L, 27]
-        # Use target from channel 0 as labels:
-        labels = full_input[:, -1, 0].long()
-        # For model input, use only observable features (channels 1:).
-        inputs["past_values"] = full_input[:, :, 1:]
-        # Similarly, if future_values is present, use observable features.
-        if "future_values" in inputs:
-            full_future = inputs["future_values"]
-            inputs["future_values"] = full_future[:, :, 1:]
+        # Now, our inputs["past_values"] contains only the observable features,
+        # and inputs["labels"] is provided separately.
+        labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device))
@@ -152,12 +181,7 @@ class CustomTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
-            full_input = inputs["past_values"]
-            labels = full_input[:, -1, 0].long()
-            inputs["past_values"] = full_input[:, :, 1:]
-            if "future_values" in inputs:
-                full_future = inputs["future_values"]
-                inputs["future_values"] = full_future[:, :, 1:]
+            labels = inputs.pop("labels").long()
             outputs = model(**inputs)
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device) if self.class_weights is not None else None)
             return (loss, outputs.prediction_logits, labels)
@@ -179,7 +203,8 @@ def main(args):
         file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
         if args.debug:
             file_list = file_list[:args.max_patients]
-        dataset = OnTheFlyForecastDFDataset(
+        # We use our OnTheFlyForecastDFDataset for preprocessing.
+        base_dataset = OnTheFlyForecastDFDataset(
             file_list=file_list,
             label_dict=label_dict,
             process_mode=args.process_mode,
@@ -188,8 +213,8 @@ def main(args):
         )
         print("Processing patient files...")
         writer = None
-        for i in tqdm(range(len(dataset))):
-            df = dataset[i]
+        for i in tqdm(range(len(base_dataset))):
+            df = base_dataset[i]
             df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
             table = pa.Table.from_pandas(df)
             if writer is None:
@@ -223,27 +248,30 @@ def main(args):
     history_length = train_df.groupby("ID").size().max()
     print(f"History length (number of rows per patient): {history_length}")
 
-    # Create ForecastDFDataset objects.
-    train_dataset = ForecastDFDataset(
+    # Create ForecastDFDataset objects with target_columns empty, so that only observable data is used.
+    base_train_dataset = ForecastDFDataset(
         data=train_df,
         id_columns=["ID"],
         timestamp_column="time_idx",
-        target_columns=feature_cols,
+        target_columns=[],  # No forecasting target is produced
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
     )
-    val_dataset = ForecastDFDataset(
+    base_val_dataset = ForecastDFDataset(
         data=val_df,
         id_columns=["ID"],
         timestamp_column="time_idx",
-        target_columns=feature_cols,
+        target_columns=[],
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
     )
+    # Wrap these datasets with our classification wrapper to add the static AKI label.
+    train_dataset = ClassificationDataset(base_train_dataset, label_dict)
+    val_dataset = ClassificationDataset(base_val_dataset, label_dict)
 
-    # Wrap datasets with DataLoader.
+    # (Optionally, create DataLoaders if needed by your Trainer—but ForecastDFDataset may be used directly.)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -344,6 +372,27 @@ def main(args):
 
     trainer.evaluate()
 
+# --- ClassificationDataset Wrapper ---
+class ClassificationDataset(Dataset):
+    """
+    A wrapper around ForecastDFDataset for classification.
+    It adds a "labels" key to each example based on the static AKI label for the patient.
+    Assumes each example from the base dataset contains an "id" key (tuple) from which the patient ID can be extracted.
+    """
+    def __init__(self, base_dataset, label_mapping):
+        self.base_dataset = base_dataset
+        self.label_mapping = label_mapping
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        example = self.base_dataset[idx]
+        # Extract patient ID (assumes example["id"] is a tuple or list)
+        patient_id = example["id"][0] if isinstance(example["id"], (tuple, list)) else example["id"]
+        example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
+        return example
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
@@ -370,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_steps", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
