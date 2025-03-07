@@ -30,7 +30,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 # --- Helper Functions ---
 
-# Fix JSON serialization by monkey-patching PretrainedConfig's to_dict method
+# Patch PretrainedConfig for JSON serialization of numpy types.
 original_to_dict = PretrainedConfig.to_dict
 def patched_to_dict(self):
     output = original_to_dict(self)
@@ -109,6 +109,7 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
+        # Set label from the label_dict.
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, 0))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -127,15 +128,14 @@ def collate_patient_batches(batch):
 class CustomTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.aki_idx = 0
         self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove "labels" if present.
-        if "labels" in inputs:
-            labels = inputs.pop("labels")
+        # Expect that the dataset provides a "labels" key.
+        if "labels" not in inputs:
+            labels = inputs["future_values"].squeeze().long() if "future_values" in inputs else inputs["past_values"][:, -1, 0].long()
         else:
-            labels = inputs["past_values"][:, -1, 0].long()
+            labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device))
@@ -146,10 +146,10 @@ class CustomTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
-            if "labels" in inputs:
-                labels = inputs.pop("labels")
+            if "labels" not in inputs:
+                labels = inputs["future_values"].squeeze().long() if "future_values" in inputs else inputs["past_values"][:, -1, 0].long()
             else:
-                labels = inputs["past_values"][:, -1, 0].long()
+                labels = inputs.pop("labels").long()
             outputs = model(**inputs)
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device) if self.class_weights is not None else None)
             return (loss, outputs.prediction_logits, labels)
@@ -171,7 +171,6 @@ def main(args):
         file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
         if args.debug:
             file_list = file_list[:args.max_patients]
-
         dataset = OnTheFlyForecastDFDataset(
             file_list=file_list,
             label_dict=label_dict,
@@ -179,7 +178,6 @@ def main(args):
             pool_window=args.pool_window,
             fixed_length=args.fixed_length
         )
-
         print("Processing patient files...")
         writer = None
         for i in tqdm(range(len(dataset))):
@@ -204,21 +202,15 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine feature columns (exclude ID, label, time_idx).
+    # Determine feature columns: use only observable features (exclude ID, label, time_idx).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
-
-    # Combined input columns (target + features).
-    combined_x_cols = sorted(list(set(["Acute_kidney_injury"] + feature_cols)))
-    print("Combined input columns (x_cols):", combined_x_cols)
-    print("Number of input channels for dataset:", len(combined_x_cols))
-
-    # Find index of target in combined_x_cols.
-    aki_index = combined_x_cols.index("Acute_kidney_injury")
-    print(f"Debug - Acute_kidney_injury is at index {aki_index} in combined_x_cols")
+    print(f"Using only observable features as model input (do not include the target).")
+    num_input_channels = len(feature_cols)
+    print(f"Number of input channels (observable features): {num_input_channels}")
 
     history_length = train_df.groupby("ID").size().max()
     print(f"History length (number of rows per patient): {history_length}")
@@ -247,7 +239,7 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # Compute class weights using inverse frequency.
+    # Compute class weights using inverse frequency from training labels.
     labels_train = train_df["Acute_kidney_injury"].values
     unique, counts = np.unique(labels_train, return_counts=True)
     print("Training label distribution:", dict(zip(unique, counts)))
@@ -262,9 +254,9 @@ def main(args):
     class_weights = torch.tensor(weight_list, dtype=torch.float)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    # Create PatchTST configuration.
+    # Create PatchTST configuration using only the observable features.
     config_dict = {
-        "num_input_channels": int(len(combined_x_cols)),  # Expecting 27 channels.
+        "num_input_channels": int(num_input_channels),  # 26 channels
         "context_length": int(history_length),
         "prediction_length": 1,
         "num_targets": 2,
@@ -286,7 +278,7 @@ def main(args):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        learning_rate=1e-5,  # Lower initial learning rate.
+        learning_rate=1e-5,
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
@@ -313,10 +305,10 @@ def main(args):
             "precision": float(precision),
             "recall": float(recall),
             "f1": float(f1),
-            "auc": float(auc),
+            "auc": float(auc)
         }
 
-    # Create our custom trainer and set class weights and aki index.
+    # Create our custom trainer, add EarlyStoppingCallback.
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -325,9 +317,10 @@ def main(args):
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
-    trainer.aki_idx = aki_index
+    # For this configuration, we assume that the ForecastDFDataset returns a "labels" key.
+    # Set class weights for weighted loss.
     trainer.class_weights = class_weights
-    print(f"Setting aki_idx in CustomTrainer to {aki_index}")
+    print("Using class weights:", class_weights)
 
     if args.no_save:
         print("Saving is disabled")
