@@ -21,9 +21,8 @@ import wandb
 
 def pool_minute(df, pool_window=60):
     """
-    Given a patient's DataFrame (each row is one second, columns are measures),
-    pool over non-overlapping windows of pool_window (in seconds) using average, ignoring NaNs.
-    Returns a new DataFrame with pooled rows.
+    Pool a patient's DataFrame over non-overlapping windows of size pool_window using average (ignoring NaNs).
+    Returns a new DataFrame.
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
     feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
@@ -49,8 +48,7 @@ def pool_minute(df, pool_window=60):
 
 def truncate_pad_series(df, fixed_length, pad_value=0):
     """
-    For one patient's DataFrame (assumed sorted by time_idx), truncate if length > fixed_length;
-    if length < fixed_length, pad with pad_value.
+    Truncate if length > fixed_length; if less, pad with pad_value.
     Returns a DataFrame with exactly fixed_length rows.
     """
     current_length = len(df)
@@ -89,11 +87,14 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
-        df["Acute_kidney_injury"] = self.label_dict.get(patient_id, 0)
+        # Force the label column to be int64 for consistency.
+        df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, 0))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
         elif self.process_mode == "pool":
             df = pool_minute(df, pool_window=self.pool_window)
+        # Ensure label column is int64
+        df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
         return df
 
 def main(args):
@@ -118,37 +119,42 @@ def main(args):
     )
     
     preprocessed_path = args.preprocessed_path
-    # Check if preprocessed Parquet file exists.
+    # Stream and save processed data to Parquet if not already saved.
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
     else:
-        print("Processing patient files...")
+        print("Processing patient files and saving to Parquet...")
         writer = None
         for i in tqdm(range(len(dataset))):
             df = dataset[i]
+            # Ensure consistent dtypes: cast label to int64.
+            df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
             table = pa.Table.from_pandas(df)
             if writer is None:
                 writer = pq.ParquetWriter(preprocessed_path, table.schema)
+            else:
+                # Cast the table to writer schema if needed.
+                table = table.cast(writer.schema)
             writer.write_table(table)
         if writer is not None:
             writer.close()
         all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
     
-    # Split by patient ID so that each patient's series remains intact.
+    # Split by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
     
-    # Determine feature columns: numeric columns except ID, label, time_idx.
+    # Determine feature columns.
     feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     
     history_length = train_df.groupby("ID").size().max()
     
-    # Create ForecastDFDataset objects from utils.
+    # Create ForecastDFDataset objects from your utils.
     train_dataset = ForecastDFDataset(
         df=train_df,
         id_col="ID",
@@ -170,15 +176,16 @@ def main(args):
         static_reals_cols=[]
     )
     
+    # Create data loaders.
     train_loader = train_dataset.to_dataloader(batch_size=args.batch_size, shuffle=True, mode="train")
     val_loader = val_dataset.to_dataloader(batch_size=args.batch_size, shuffle=False, mode="valid")
     
-    # Configure PatchTST model for classification.
+    # Configure PatchTST model.
     config = PatchTSTConfig(
         num_input_channels=len(feature_cols),
         context_length=history_length,
         prediction_length=1,
-        num_targets=2,  # binary classification: 0 and 1
+        num_targets=2,  # binary classification.
         patch_length=args.patch_length,
         patch_stride=args.patch_stride,
         d_model=args.d_model,
@@ -228,9 +235,9 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Debug mode: process only a few patients.")
     parser.add_argument("--max_patients", type=int, default=10, help="Max patients to process in debug mode.")
     parser.add_argument("--process_mode", type=str, choices=["truncate", "pool", "none"], default="pool",
-                        help="Preprocessing mode: 'truncate' to pad/truncate to fixed length, 'pool' for minute pooling, or 'none'.")
+                        help="Preprocessing mode: 'truncate' to pad/truncate, 'pool' for minute pooling, or 'none'.")
     parser.add_argument("--fixed_length", type=int, default=10800,
-                        help="Fixed length if using 'truncate' mode (e.g., 10800 for 3 hours at 1-second resolution).")
+                        help="Fixed length if using 'truncate' mode (e.g., 10800 for 3 hours at 1-sec resolution).")
     parser.add_argument("--pool_window", type=int, default=60,
                         help="Window size for pooling (e.g., 60 seconds).")
     parser.add_argument("--pool_method", type=str, choices=["average", "max", "median"], default="average",
