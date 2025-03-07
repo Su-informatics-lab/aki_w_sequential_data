@@ -7,6 +7,8 @@ from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Import your ForecastDFDataset from utils
 from utils import ForecastDFDataset
@@ -94,46 +96,44 @@ class OnTheFlyForecastDFDataset(Dataset):
             df = pool_minute(df, pool_window=self.pool_window)
         return df
 
-def collate_patient_batches(batch):
-    """
-    Given a list of processed patient DataFrames (one per patient), collate them into one DataFrame.
-    """
-    return pd.concat(batch, ignore_index=True)
-
-# --- Main function ---
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
     
-    # Load AKI labels from Excel
+    # Load AKI labels from Excel.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates()
     label_dict = dict(zip(df_labels["ID"], df_labels["Acute_kidney_injury"]))
     
-    # Check if preprocessed data exists; if yes, load it.
+    # Get list of patient CSV file paths.
+    file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
+    if args.debug:
+        file_list = file_list[:args.max_patients]
+    
+    dataset = OnTheFlyForecastDFDataset(
+        file_list=file_list,
+        label_dict=label_dict,
+        process_mode=args.process_mode,
+        pool_window=args.pool_window,
+        fixed_length=args.fixed_length
+    )
+    
     preprocessed_path = args.preprocessed_path
+    # Check if preprocessed Parquet file exists.
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
     else:
-        # Get list of patient CSV file paths.
-        file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
-        if args.debug:
-            file_list = file_list[:args.max_patients]
-    
-        # Create on-the-fly dataset.
-        dataset = OnTheFlyForecastDFDataset(
-            file_list=file_list,
-            label_dict=label_dict,
-            process_mode=args.process_mode,
-            pool_window=args.pool_window,
-            fixed_length=args.fixed_length
-        )
-    
         print("Processing patient files...")
-        all_patients_df = collate_patient_batches([dataset[i] for i in tqdm(range(len(dataset)))])
-    
-        # Save the processed data to Parquet for future use.
-        all_patients_df.to_parquet(preprocessed_path, index=False)
+        writer = None
+        for i in tqdm(range(len(dataset))):
+            df = dataset[i]
+            table = pa.Table.from_pandas(df)
+            if writer is None:
+                writer = pq.ParquetWriter(preprocessed_path, table.schema)
+            writer.write_table(table)
+        if writer is not None:
+            writer.close()
+        all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
     
     # Split by patient ID so that each patient's series remains intact.
@@ -146,10 +146,9 @@ def main(args):
     feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     
-    # Assume that after processing, every patient has the same number of rows.
     history_length = train_df.groupby("ID").size().max()
     
-    # Create ForecastDFDataset objects using your utils.
+    # Create ForecastDFDataset objects from utils.
     train_dataset = ForecastDFDataset(
         df=train_df,
         id_col="ID",
@@ -171,7 +170,6 @@ def main(args):
         static_reals_cols=[]
     )
     
-    # Create data loaders (assumes ForecastDFDataset has .to_dataloader())
     train_loader = train_dataset.to_dataloader(batch_size=args.batch_size, shuffle=True, mode="train")
     val_loader = val_dataset.to_dataloader(batch_size=args.batch_size, shuffle=False, mode="valid")
     
@@ -189,7 +187,6 @@ def main(args):
     )
     model = PatchTSTForClassification(config)
     
-    # Set up training arguments with WandB logging enabled.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
