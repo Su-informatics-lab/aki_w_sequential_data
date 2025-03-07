@@ -6,24 +6,24 @@ Overall Process:
 +--------------------------------------------------------------+
 |                      Raw CSV Files                           |
 |  Each patient file contains a time series with columns:      |
-|  Monitoring signals (26 channels) – no ID column is stored in   |
-|  the CSV. The patient ID is inferred from the file name (e.g.,  |
-|  "R94657_combined.csv" yields ID "R94657").                    |
+|  Monitoring signals (26 channels). The patient ID is inferred  |
+|  from the file name (e.g., "R94657_combined.csv" yields ID "R94657").|
 +--------------------------------------------------------------+
               |
-              | Preprocessing (pooling/truncating) is applied per CSV,
-              | and an "ID" column is added (from the file name) along with
-              | a "time_idx" column. The static AKI label is obtained via the ID.
+              | Preprocessing: Each CSV is processed (via pooling or
+              | truncation) to a fixed-length window. An "ID" column and
+              | a "time_idx" column are added. The static AKI label is
+              | obtained via the file name and the Excel file.
               v
 +--------------------------------------------------------------+
 |         Combined Preprocessed DataFrame (Parquet)            |
 | Columns: ID, Acute_kidney_injury, time_idx, F1, F2, ..., F26     |
 +--------------------------------------------------------------+
               |
-              | Filter: drop rows whose ID is not in the label mapping.
+              | Filter: Drop rows whose ID is not found in the label mapping.
               v
 +--------------------------------------------------------------+
-|      DataFrame with only valid patient IDs                   |
+|     Filtered DataFrame with only valid patient IDs           |
 +--------------------------------------------------------------+
               |
               | Split by unique patient IDs into train and validation sets
@@ -34,17 +34,18 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only observable channels are used as input to PatchTST)       |
+|  (Only the observable signals, 26 channels, are used as input)   |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
-              | by matching the patient ID to the label mapping.
+              | by either using the "Acute_kidney_injury" column (if present)
+              | or looking up via the patient ID.
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
 |  Each example is a dict containing:                          |
 |    - past_values: tensor of shape [context_length, 26]         |
-|    - labels: scalar (AKI label from imputed_demo_data.xlsx)      |
+|    - labels: scalar (AKI label)                                |
 +--------------------------------------------------------------+
               |
               | DataLoader batches examples
@@ -55,7 +56,7 @@ Overall Process:
 |  Classification head produces prediction logits                |
 +--------------------------------------------------------------+
               |
-              | Loss computed using provided "labels"
+              | Loss computed using the provided "labels"
               v
 +--------------------------------------------------------------+
 |          Training via CustomTrainer (with EarlyStopping)       |
@@ -170,12 +171,10 @@ class OnTheFlyForecastDFDataset(Dataset):
         fname = os.path.basename(csv_path)
         # Infer patient ID from the file name (e.g., "R94657_combined.csv" -> "R94657")
         patient_id = fname.split('_')[0].strip()
-        # Load CSV
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
-        # Add patient ID column
         df["ID"] = patient_id
-        # Set AKI label using label_dict; if missing, raise error.
+        # Set AKI label; if missing, np.nan will be returned.
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, np.nan))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -193,8 +192,11 @@ def collate_patient_batches(batch):
 # --- Custom Dataset Wrapper for Classification ---
 class ClassificationDataset(Dataset):
     """
-    A wrapper around ForecastDFDataset that adds a static label "labels" to each example.
-    It expects each example from the base dataset to have an "id" key and uses that to look up the AKI label.
+    A wrapper around ForecastDFDataset for classification.
+    It adds a static label "labels" to each example.
+    It expects each example from the base dataset to have an "id" key.
+    If the example already contains a column "Acute_kidney_injury" as a time series,
+    this wrapper uses the static label from the label mapping.
     """
     def __init__(self, base_dataset, label_mapping):
         self.base_dataset = base_dataset
@@ -207,9 +209,10 @@ class ClassificationDataset(Dataset):
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
         # Extract patient ID from example["id"]
-        patient_id = example["id"][0] if isinstance(example["id"], (tuple, list)) else str(example["id"]).strip()
+        patient_id = example["id"][0] if isinstance(example.get("id"), (tuple, list)) else str(example.get("id")).strip()
         if patient_id not in self.label_mapping:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
+        # Attach static label
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
         return example
 
@@ -285,7 +288,7 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # IMPORTANT: Filter out any rows whose "ID" is not in the label mapping.
+    # Filter out any rows whose "ID" is not in the label mapping.
     all_patients_df = all_patients_df[all_patients_df["ID"].isin(label_dict.keys())]
 
     # Split data by patient ID.
@@ -294,7 +297,7 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine observable features (exclude ID, target, time_idx).
+    # Determine observable features: exclude ID, target, and time_idx.
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
