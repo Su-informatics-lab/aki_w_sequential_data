@@ -30,7 +30,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 # --- Helper Functions ---
 
-# Patch PretrainedConfig for JSON serialization of numpy types.
+# Patch PretrainedConfig's to_dict to fix JSON serialization for numpy types.
 original_to_dict = PretrainedConfig.to_dict
 def patched_to_dict(self):
     output = original_to_dict(self)
@@ -90,7 +90,7 @@ class OnTheFlyForecastDFDataset(Dataset):
     def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
         """
         file_list: list of CSV file paths.
-        label_dict: dictionary mapping patient ID -> AKI label.
+        label_dict: dict mapping patient ID -> AKI label.
         process_mode: "pool", "truncate", or "none".
         """
         self.file_list = file_list
@@ -109,7 +109,6 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
-        # Set label from the label_dict.
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, 0))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -202,13 +201,13 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine feature columns: use only observable features (exclude ID, label, time_idx).
+    # Determine feature columns (only observable features).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
-    print(f"Using only observable features as model input (do not include the target).")
+    print("Using only observable features as model input (do not include the target).")
     num_input_channels = len(feature_cols)
     print(f"Number of input channels (observable features): {num_input_channels}")
 
@@ -308,7 +307,7 @@ def main(args):
             "auc": float(auc)
         }
 
-    # Create our custom trainer, add EarlyStoppingCallback.
+    # Create our custom trainer with EarlyStoppingCallback.
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -317,8 +316,7 @@ def main(args):
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
-    # For this configuration, we assume that the ForecastDFDataset returns a "labels" key.
-    # Set class weights for weighted loss.
+    # Since we are not including the target as input, no need to set aki_idx.
     trainer.class_weights = class_weights
     print("Using class weights:", class_weights)
 
