@@ -20,7 +20,7 @@ Overall Process:
 | Columns: ID, Acute_kidney_injury, time_idx, F1, F2, ..., F26     |
 +--------------------------------------------------------------+
               |
-              | Filter: Drop rows whose ID is not found in the label mapping.
+              | Filter: Drop rows whose ID is not in the label mapping.
               v
 +--------------------------------------------------------------+
 |     Filtered DataFrame with only valid patient IDs           |
@@ -34,18 +34,17 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only the observable signals, 26 channels, are used as input)   |
+|  (Only the observable signals are used as input to PatchTST)     |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
-              | by either using the "Acute_kidney_injury" column (if present)
-              | or looking up via the patient ID.
+              | by matching the patient ID (from "id" or "ID") to the label mapping.
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
 |  Each example is a dict containing:                          |
 |    - past_values: tensor of shape [context_length, 26]         |
-|    - labels: scalar (AKI label)                                |
+|    - labels: scalar (AKI label from imputed_demo_data.xlsx)      |
 +--------------------------------------------------------------+
               |
               | DataLoader batches examples
@@ -56,7 +55,7 @@ Overall Process:
 |  Classification head produces prediction logits                |
 +--------------------------------------------------------------+
               |
-              | Loss computed using the provided "labels"
+              | Loss computed using provided "labels"
               v
 +--------------------------------------------------------------+
 |          Training via CustomTrainer (with EarlyStopping)       |
@@ -174,7 +173,7 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
-        # Set AKI label; if missing, np.nan will be returned.
+        # Set AKI label using label_dict; if missing, np.nan is returned.
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, np.nan))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -193,14 +192,11 @@ def collate_patient_batches(batch):
 class ClassificationDataset(Dataset):
     """
     A wrapper around ForecastDFDataset for classification.
-    It adds a static label "labels" to each example.
-    It expects each example from the base dataset to have an "id" key.
-    If the example already contains a column "Acute_kidney_injury" as a time series,
-    this wrapper uses the static label from the label mapping.
+    It adds a static label "labels" to each example based on the patient ID.
     """
     def __init__(self, base_dataset, label_mapping):
         self.base_dataset = base_dataset
-        # Ensure keys are strings and stripped.
+        # Ensure keys in label_mapping are strings and stripped.
         self.label_mapping = {str(k).strip(): v for k, v in label_mapping.items()}
 
     def __len__(self):
@@ -208,11 +204,20 @@ class ClassificationDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Extract patient ID from example["id"]
-        patient_id = example["id"][0] if isinstance(example.get("id"), (tuple, list)) else str(example.get("id")).strip()
+        # Look for patient ID in "id" or "ID"
+        patient_id = None
+        if "id" in example:
+            patient_id = example["id"]
+        elif "ID" in example:
+            patient_id = example["ID"]
+        if patient_id is None:
+            raise KeyError("No patient ID found in example.")
+        if isinstance(patient_id, (tuple, list)):
+            patient_id = str(patient_id[0]).strip()
+        else:
+            patient_id = str(patient_id).strip()
         if patient_id not in self.label_mapping:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
-        # Attach static label
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
         return example
 
@@ -249,7 +254,7 @@ def main(args):
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
 
-    # Filter file list: only include CSV files whose patient ID is in label_dict.
+    # Filter file list: include only CSV files whose patient ID is in label_dict.
     file_list = [
         os.path.join(args.data_dir, fname)
         for fname in os.listdir(args.data_dir)
@@ -297,7 +302,7 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine observable features: exclude ID, target, and time_idx.
+    # Determine observable features: exclude ID, target, time_idx.
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
