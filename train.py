@@ -13,7 +13,7 @@ Overall Process:
               |
               | Preprocessing (pooling/truncating) is applied per CSV,
               | and an "ID" column is added (from the file name) along with
-              | a "time_idx" column. The AKI label is later obtained via the ID.
+              | a "time_idx" column. The static AKI label is obtained via the ID.
               v
 +--------------------------------------------------------------+
 |         Combined Preprocessed DataFrame (Parquet)            |
@@ -36,8 +36,8 @@ Overall Process:
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
-|  Each example is a dict with:                                  |
-|    - past_values: tensor of shape [L, 26]                       |
+|  Each example is a dict containing:                          |
+|    - past_values: tensor of shape [context_length, 26]         |
 |    - labels: scalar (AKI label from imputed_demo_data.xlsx)      |
 +--------------------------------------------------------------+
               |
@@ -45,11 +45,11 @@ Overall Process:
               v
 +--------------------------------------------------------------+
 |            PatchTST Classification Model                     |
-|  Input: [batch, L, 26] observable channels                      |
+|  Input: [batch, context_length, 26] observable channels         |
 |  Classification head produces prediction logits                |
 +--------------------------------------------------------------+
               |
-              | Loss computed using provided "labels" and class weights
+              | Loss computed using provided "labels"
               v
 +--------------------------------------------------------------+
 |          Training via CustomTrainer (with EarlyStopping)       |
@@ -143,12 +143,52 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
+class OnTheFlyForecastDFDataset(Dataset):
+    def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
+        """
+        file_list: list of CSV file paths.
+        label_dict: dict mapping patient ID -> AKI label.
+        process_mode: "pool", "truncate", or "none".
+        """
+        self.file_list = file_list
+        self.label_dict = label_dict
+        self.process_mode = process_mode
+        self.pool_window = pool_window
+        self.fixed_length = fixed_length
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        csv_path = self.file_list[idx]
+        fname = os.path.basename(csv_path)
+        # Infer patient ID from the file name (e.g., "R94657_combined.csv" -> "R94657")
+        patient_id = fname.split('_')[0].strip()
+        # Load CSV
+        df = pd.read_csv(csv_path)
+        df["time_idx"] = range(len(df))
+        # Add patient ID column
+        df["ID"] = patient_id
+        # Set AKI label using label_dict; if missing, KeyError will be raised
+        df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, np.nan))
+        if self.process_mode == "truncate":
+            df = truncate_pad_series(df, fixed_length=self.fixed_length)
+        elif self.process_mode == "pool":
+            df = pool_minute(df, pool_window=self.pool_window)
+        df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
+        return df
+
+def collate_patient_batches(batch):
+    """
+    Collate a list of processed patient DataFrames into one DataFrame.
+    """
+    return pd.concat(batch, ignore_index=True)
+
 # --- Custom Dataset Wrapper for Classification ---
 class ClassificationDataset(Dataset):
     """
     A wrapper around ForecastDFDataset that adds a static label "labels" to each example.
-    It expects each example from the base dataset to have an "id" key (a tuple or string),
-    and uses that to look up the AKI label from label_mapping.
+    It expects each example from the base dataset to have an "id" key and uses that to look up the AKI label.
     """
     def __init__(self, base_dataset, label_mapping):
         self.base_dataset = base_dataset
@@ -160,7 +200,7 @@ class ClassificationDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Extract patient ID from example["id"].
+        # Extract patient ID from example["id"]
         patient_id = example["id"][0] if isinstance(example["id"], (tuple, list)) else str(example["id"]).strip()
         if patient_id not in self.label_mapping:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
@@ -174,7 +214,7 @@ class CustomTrainer(Trainer):
         self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Now, our dataset is a ClassificationDataset and provides "labels" separately.
+        # Use the provided labels from ClassificationDataset.
         labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
@@ -195,20 +235,23 @@ class CustomTrainer(Trainer):
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
 
-    # Load AKI labels from Excel; convert keys to strings.
+    # Load AKI labels from Excel and drop rows with NaN labels.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
+    # Convert keys to strings and strip whitespace.
     label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
+
+    # Filter file list: only include CSV files whose patient ID is present in label_dict.
+    file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir)
+                 if fname.endswith(".csv") and fname.split('_')[0].strip() in label_dict]
+    if args.debug:
+        file_list = file_list[:args.max_patients]
 
     preprocessed_path = args.preprocessed_path
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
     else:
-        file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
-        if args.debug:
-            file_list = file_list[:args.max_patients]
-        # Use OnTheFlyForecastDFDataset for preprocessing.
         base_dataset = OnTheFlyForecastDFDataset(
             file_list=file_list,
             label_dict=label_dict,
@@ -240,7 +283,7 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine observable features (exclude ID, target, time_idx).
+    # Determine feature columns: use only observable features (exclude ID, target, time_idx).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
@@ -276,7 +319,7 @@ def main(args):
     train_dataset = ClassificationDataset(base_train_dataset, label_dict)
     val_dataset = ClassificationDataset(base_val_dataset, label_dict)
 
-    # Optionally create DataLoaders (if needed by Trainer)
+    # Create DataLoaders.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
