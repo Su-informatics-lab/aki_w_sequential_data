@@ -20,6 +20,12 @@ Overall Process:
 | Columns: ID, Acute_kidney_injury, time_idx, F1, F2, ..., F26     |
 +--------------------------------------------------------------+
               |
+              | Filter: drop rows whose ID is not in the label mapping.
+              v
++--------------------------------------------------------------+
+|      DataFrame with only valid patient IDs                   |
++--------------------------------------------------------------+
+              |
               | Split by unique patient IDs into train and validation sets
               v
 +--------------------------------------------------------------+
@@ -32,7 +38,7 @@ Overall Process:
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
-              | by matching the patient ID (from file name) to the label mapping.
+              | by matching the patient ID to the label mapping.
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
@@ -169,7 +175,7 @@ class OnTheFlyForecastDFDataset(Dataset):
         df["time_idx"] = range(len(df))
         # Add patient ID column
         df["ID"] = patient_id
-        # Set AKI label using label_dict; if missing, KeyError will be raised
+        # Set AKI label using label_dict; if missing, raise error.
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, np.nan))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -192,7 +198,7 @@ class ClassificationDataset(Dataset):
     """
     def __init__(self, base_dataset, label_mapping):
         self.base_dataset = base_dataset
-        # Ensure all keys in label_mapping are strings (stripped).
+        # Ensure keys are strings and stripped.
         self.label_mapping = {str(k).strip(): v for k, v in label_mapping.items()}
 
     def __len__(self):
@@ -237,12 +243,10 @@ def main(args):
 
     # Load AKI labels from Excel and drop rows with NaN labels.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
-    df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(
-        subset=["Acute_kidney_injury"])
-    label_dict = {str(x).strip(): y for x, y in
-                  zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
+    df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
+    label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
 
-    # Filter file list: only include CSV files whose patient ID is present in label_dict.
+    # Filter file list: only include CSV files whose patient ID is in label_dict.
     file_list = [
         os.path.join(args.data_dir, fname)
         for fname in os.listdir(args.data_dir)
@@ -281,13 +285,16 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
+    # IMPORTANT: Filter out any rows whose "ID" is not in the label mapping.
+    all_patients_df = all_patients_df[all_patients_df["ID"].isin(label_dict.keys())]
+
     # Split data by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine feature columns: use only observable features (exclude ID, target, time_idx).
+    # Determine observable features (exclude ID, target, time_idx).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
