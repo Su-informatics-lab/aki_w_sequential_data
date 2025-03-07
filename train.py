@@ -15,7 +15,7 @@ import json
 from sklearn.metrics import roc_auc_score
 
 # Import your ForecastDFDataset from utils.
-from utils import ForecastDFDataset
+from tsfm_public.toolkit.dataset import ForecastDFDataset
 
 # Import PatchTST classes and EarlyStoppingCallback from Hugging Face Transformers.
 from transformers import (
@@ -228,7 +228,7 @@ def main(args):
         data=train_df,
         id_columns=["ID"],
         timestamp_column="time_idx",
-        target_columns=["Acute_kidney_injury"],
+        target_columns=feature_cols,
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
@@ -237,7 +237,7 @@ def main(args):
         data=val_df,
         id_columns=["ID"],
         timestamp_column="time_idx",
-        target_columns=["Acute_kidney_injury"],
+        target_columns=feature_cols,
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
