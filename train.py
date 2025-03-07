@@ -152,8 +152,11 @@ def main(args):
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
     # Determine feature columns: numeric columns except ID, Acute_kidney_injury, time_idx.
-    feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
+    feature_cols = [col for col in all_patients_df.columns
+                    if col not in {"ID", "Acute_kidney_injury", "time_idx"}
+                    and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
+
     # Remove any extra columns that start with "Unnamed"
     feature_cols = [col for col in feature_cols if not col.startswith("Unnamed")]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
