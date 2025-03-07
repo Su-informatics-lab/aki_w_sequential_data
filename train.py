@@ -30,7 +30,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 # --- Helper Functions ---
 
-# Patch PretrainedConfig's to_dict to fix JSON serialization for numpy types.
+# Patch PretrainedConfig's to_dict for JSON serialization.
 original_to_dict = PretrainedConfig.to_dict
 def patched_to_dict(self):
     output = original_to_dict(self)
@@ -130,11 +130,18 @@ class CustomTrainer(Trainer):
         self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Expect that the dataset provides a "labels" key.
-        if "labels" not in inputs:
-            labels = inputs["future_values"].squeeze().long() if "future_values" in inputs else inputs["past_values"][:, -1, 0].long()
-        else:
-            labels = inputs.pop("labels").long()
+        # Here, we assume the dataset returns "past_values" with shape [B, L, C]
+        # where C = combined channels (27 = target + 26 observable).
+        # We want to strip the target (assumed at index 0) from the input before feeding to the model.
+        full_input = inputs["past_values"]  # shape: [B, L, 27]
+        # Use target from channel 0 as labels:
+        labels = full_input[:, -1, 0].long()
+        # For model input, use only observable features (channels 1:).
+        inputs["past_values"] = full_input[:, :, 1:]
+        # Similarly, if future_values is present, use observable features.
+        if "future_values" in inputs:
+            full_future = inputs["future_values"]
+            inputs["future_values"] = full_future[:, :, 1:]
         outputs = model(**inputs)
         if self.class_weights is not None:
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device))
@@ -145,10 +152,12 @@ class CustomTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
-            if "labels" not in inputs:
-                labels = inputs["future_values"].squeeze().long() if "future_values" in inputs else inputs["past_values"][:, -1, 0].long()
-            else:
-                labels = inputs.pop("labels").long()
+            full_input = inputs["past_values"]
+            labels = full_input[:, -1, 0].long()
+            inputs["past_values"] = full_input[:, :, 1:]
+            if "future_values" in inputs:
+                full_future = inputs["future_values"]
+                inputs["future_values"] = full_future[:, :, 1:]
             outputs = model(**inputs)
             loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device) if self.class_weights is not None else None)
             return (loss, outputs.prediction_logits, labels)
@@ -201,7 +210,7 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine feature columns (only observable features).
+    # Determine feature columns: use only observable features (exclude ID, target, time_idx).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
@@ -253,7 +262,7 @@ def main(args):
     class_weights = torch.tensor(weight_list, dtype=torch.float)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    # Create PatchTST configuration using only the observable features.
+    # Create PatchTST configuration using only observable features.
     config_dict = {
         "num_input_channels": int(num_input_channels),  # 26 channels
         "context_length": int(history_length),
@@ -277,7 +286,7 @@ def main(args):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        learning_rate=1e-5,
+        learning_rate=1e-6,
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
@@ -316,7 +325,6 @@ def main(args):
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
-    # Since we are not including the target as input, no need to set aki_idx.
     trainer.class_weights = class_weights
     print("Using class weights:", class_weights)
 
