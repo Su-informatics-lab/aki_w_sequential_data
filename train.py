@@ -10,6 +10,7 @@ from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 import wandb
+import torch.nn.functional as F
 
 # Import your ForecastDFDataset from utils.
 from utils import ForecastDFDataset
@@ -26,7 +27,8 @@ def pool_minute(df, pool_window=60):
     ignoring NaNs. Returns a new DataFrame with pooled rows.
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
-    feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
+    feature_cols = [col for col in df.columns
+                    if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
     n = len(df)
     num_windows = int(np.ceil(n / pool_window))
@@ -102,6 +104,19 @@ def collate_patient_batches(batch):
     """
     return pd.concat(batch, ignore_index=True)
 
+# Custom compute_loss function to inject labels if not present.
+def compute_loss(model, inputs, return_outputs=False):
+    # If 'labels' is not in inputs, try to use 'future_values' or the last value from 'past_values'
+    if "labels" not in inputs:
+        if "future_values" in inputs:
+            inputs["labels"] = inputs["future_values"].squeeze()
+        else:
+            # Use the last value of the first feature from past_values as a fallback.
+            inputs["labels"] = inputs["past_values"][:, -1, 0]
+    outputs = model(**inputs)
+    loss = outputs.loss
+    return (loss, outputs) if return_outputs else loss
+
 # --- Main function ---
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
@@ -144,7 +159,7 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
 
-    # Debug print: show all columns in preprocessed data.
+    # Debug prints: show columns in preprocessed data.
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
     # Split by patient ID so that each patient's series remains intact.
@@ -160,8 +175,7 @@ def main(args):
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # Because ForecastDFDataset joins target_columns with observable_columns,
-    # our effective input channels will be:
+    # In our case, ForecastDFDataset will combine target_columns and observable_columns.
     combined_x_cols = list(set(["Acute_kidney_injury"] + feature_cols))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
@@ -195,7 +209,7 @@ def main(args):
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
-        num_input_channels=len(combined_x_cols),  # use combined_x_cols length (27 in your case)
+        num_input_channels=len(combined_x_cols),  # use the combined list length (likely 27)
         context_length=history_length,
         prediction_length=1,
         num_targets=2,  # binary classification: 0 and 1
@@ -233,6 +247,7 @@ def main(args):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        compute_loss=compute_loss,  # use our custom compute_loss function
         compute_metrics=compute_metrics,
     )
 
