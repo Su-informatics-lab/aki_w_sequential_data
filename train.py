@@ -107,29 +107,82 @@ def collate_patient_batches(batch):
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Extract the target column values from future_values to use as labels
-        # The first column of future_values is 'Acute_kidney_injury' based on combined_x_cols
-        future_values = inputs.get("future_values")
+        # In ForecastDFDataset, one of the batch items should contain the target column
+        # We need to find where the Acute_kidney_injury values are stored
 
-        # Take the first time step from future_values (index 0) and then take the column that corresponds to AKI
-        # Find the index of 'Acute_kidney_injury' in x_cols
-        # This is based on the log showing 'Acute_kidney_injury' in the list of input columns
-        aki_idx = 23  # Based on the position in combined_x_cols
+        # Print keys in inputs to debug what's available
+        print("Debug - Keys in inputs:", list(inputs.keys()))
 
-        # Extract the labels - taking the first prediction step and the AKI column
-        if future_values.size(1) > 0:  # Check if future_values has at least one time step
-            labels = future_values[:, 0, aki_idx].long()  # Convert to long for classification
+        # Find the AKI column in inputs
+        # Option 1: Try to get AKI from past_values since it contains all columns
+        past_values = inputs.get("past_values")
+        if past_values is not None:
+            print("Debug - past_values shape:", past_values.shape)
+
+            # From the combined_x_cols log, Acute_kidney_injury is at index 19
+            aki_idx = 19  # Updated based on the latest log
+
+            # Extract the last timestep's AKI value for each sample
+            # This is making the assumption that the last value is the label we want
+            labels = past_values[:, -1, aki_idx].long()
+
+            # Debug print
+            print(f"Debug - Extracted {len(labels)} labels from past_values")
+            print(f"Debug - Label distribution: {torch.bincount(labels)}")
+
+            # Forward pass
+            outputs = model(**inputs)
+
+            # Compute cross-entropy loss using prediction_logits
+            loss = F.cross_entropy(outputs.prediction_logits, labels)
+
+            return (loss, outputs) if return_outputs else loss
         else:
-            # If there are no future values (edge case), use zeros as labels
-            labels = torch.zeros(future_values.size(0), dtype=torch.long, device=future_values.device)
+            raise ValueError("past_values not found in inputs. Cannot extract labels for training.")
 
-        # Forward pass
-        outputs = model(**inputs)
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # We need to override this to handle label extraction for evaluation too
+        inputs = self._prepare_inputs(inputs)
 
-        # Compute cross-entropy loss using prediction_logits
-        loss = F.cross_entropy(outputs.prediction_logits, labels)
+        with torch.no_grad():
+            # Extract labels
+            past_values = inputs.get("past_values")
+            aki_idx = 19  # Same index as in compute_loss
 
-        return (loss, outputs) if return_outputs else loss
+            if past_values is not None:
+                labels = past_values[:, -1, aki_idx].long()
+
+                # Forward pass
+                outputs = model(**inputs)
+
+                # Compute loss
+                loss = F.cross_entropy(outputs.prediction_logits, labels)
+
+                return (loss, outputs.prediction_logits, labels)
+            else:
+                raise ValueError("past_values not found in inputs during prediction step")
+
+    def compute_metrics(self, eval_pred):
+        # This will be used in the Trainer instead of the standalone compute_metrics function
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        accuracy = (preds == labels).mean()
+
+        # Add precision, recall, F1 for the positive class (AKI=1)
+        tp = np.sum((preds == 1) & (labels == 1))
+        fp = np.sum((preds == 1) & (labels == 0))
+        fn = np.sum((preds == 0) & (labels == 1))
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        return {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1
+        }
 
 # --- Main function ---
 def main(args):
@@ -194,6 +247,10 @@ def main(args):
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
 
+    # Find the index of Acute_kidney_injury in the combined_x_cols list
+    aki_index = combined_x_cols.index("Acute_kidney_injury")
+    print(f"Debug - Acute_kidney_injury is at index {aki_index} in combined_x_cols")
+
     history_length = train_df.groupby("ID").size().max()
     print(f"History length (number of rows per patient): {history_length}")
 
@@ -216,10 +273,6 @@ def main(args):
         context_length=history_length,
         prediction_length=1,
     )
-
-    # Wrap datasets with torch DataLoader.
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
@@ -246,22 +299,15 @@ def main(args):
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="loss",
+        metric_for_best_model="f1",  # Use F1 as the primary metric for model selection
         report_to=["wandb"],
     )
-
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        accuracy = (preds == labels).mean()
-        return {"accuracy": accuracy}
 
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
     )
 
     trainer.train()
