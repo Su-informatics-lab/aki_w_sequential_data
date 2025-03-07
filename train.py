@@ -10,7 +10,6 @@ from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 import wandb
-import torch.nn.functional as F
 
 # Import your ForecastDFDataset from utils.
 from utils import ForecastDFDataset
@@ -104,18 +103,19 @@ def collate_patient_batches(batch):
     """
     return pd.concat(batch, ignore_index=True)
 
-# Custom compute_loss function to inject labels if not present.
-def compute_loss(model, inputs, return_outputs=False):
-    # If 'labels' is not in inputs, try to use 'future_values' or the last value from 'past_values'
-    if "labels" not in inputs:
-        if "future_values" in inputs:
-            inputs["labels"] = inputs["future_values"].squeeze()
-        else:
-            # Use the last value of the first feature from past_values as a fallback.
-            inputs["labels"] = inputs["past_values"][:, -1, 0]
-    outputs = model(**inputs)
-    loss = outputs.loss
-    return (loss, outputs) if return_outputs else loss
+# --- Custom Trainer ---
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # If labels are not present, try to inject them
+        if "labels" not in inputs:
+            if "future_values" in inputs:
+                inputs["labels"] = inputs["future_values"].squeeze()
+            else:
+                # Fallback: use last value of past_values (first feature)
+                inputs["labels"] = inputs["past_values"][:, -1, 0]
+        outputs = model(**inputs)
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
 # --- Main function ---
 def main(args):
@@ -175,7 +175,7 @@ def main(args):
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # In our case, ForecastDFDataset will combine target_columns and observable_columns.
+    # Create combined input columns (we include the target column as well).
     combined_x_cols = list(set(["Acute_kidney_injury"] + feature_cols))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
@@ -209,7 +209,7 @@ def main(args):
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
-        num_input_channels=len(combined_x_cols),  # use the combined list length (likely 27)
+        num_input_channels=len(combined_x_cols),  # Expecting the combined list length
         context_length=history_length,
         prediction_length=1,
         num_targets=2,  # binary classification: 0 and 1
@@ -242,17 +242,30 @@ def main(args):
         accuracy = (preds == labels).mean()
         return {"accuracy": accuracy}
 
-    trainer = Trainer(
+    # Use the custom Trainer subclass to override compute_loss.
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        compute_loss=compute_loss,  # use our custom compute_loss function
         compute_metrics=compute_metrics,
     )
 
     trainer.train()
     trainer.evaluate()
+
+# --- Custom Trainer subclass to override compute_loss ---
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # Inject labels if missing.
+        if "labels" not in inputs:
+            if "future_values" in inputs:
+                inputs["labels"] = inputs["future_values"].squeeze()
+            else:
+                inputs["labels"] = inputs["past_values"][:, -1, 0]
+        outputs = model(**inputs)
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
