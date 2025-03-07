@@ -107,14 +107,11 @@ def collate_patient_batches(batch):
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # If "labels" is missing, try to inject them.
-        if "labels" not in inputs:
-            if "future_values" in inputs:
-                inputs["labels"] = inputs["future_values"].squeeze()
-            else:
-                inputs["labels"] = inputs["past_values"][:, -1, 0]
+        # Remove 'labels' from inputs and compute loss manually.
+        labels = inputs.pop("labels")
         outputs = model(**inputs)
-        loss = outputs.loss
+        # Compute cross-entropy loss using prediction_logits.
+        loss = F.cross_entropy(outputs.prediction_logits, labels)
         return (loss, outputs) if return_outputs else loss
 
 # --- Main function ---
@@ -175,7 +172,7 @@ def main(args):
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # Create combined input columns (if you choose to include target in inputs).
+    # Create combined input columns. Here we join the target column with feature_cols.
     combined_x_cols = list(set(["Acute_kidney_injury"] + feature_cols))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
@@ -209,7 +206,7 @@ def main(args):
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
-        num_input_channels=len(combined_x_cols),  # using the combined list length (27 in your case)
+        num_input_channels=len(combined_x_cols),  # Expecting 27 channels in your case.
         context_length=history_length,
         prediction_length=1,
         num_targets=2,  # binary classification: 0 and 1
@@ -242,7 +239,6 @@ def main(args):
         accuracy = (preds == labels).mean()
         return {"accuracy": accuracy}
 
-    # Use the custom Trainer subclass.
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -257,14 +253,10 @@ def main(args):
 # --- Custom Trainer subclass ---
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # If 'labels' not in inputs, try to inject them.
-        if "labels" not in inputs:
-            if "future_values" in inputs:
-                inputs["labels"] = inputs["future_values"].squeeze()
-            else:
-                inputs["labels"] = inputs["past_values"][:, -1, 0]
+        # Remove 'labels' from inputs and compute loss manually.
+        labels = inputs.pop("labels")
         outputs = model(**inputs)
-        loss = outputs.loss
+        loss = F.cross_entropy(outputs.prediction_logits, labels)
         return (loss, outputs) if return_outputs else loss
 
 if __name__ == "__main__":
