@@ -104,6 +104,28 @@ def collate_patient_batches(batch):
     """
     return pd.concat(batch, ignore_index=True)
 
+# Define a separate compute_metrics function (not inside CustomTrainer)
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    accuracy = (preds == labels).mean()
+
+    # Add precision, recall, F1 for the positive class (AKI=1)
+    tp = np.sum((preds == 1) & (labels == 1))
+    fp = np.sum((preds == 1) & (labels == 0))
+    fn = np.sum((preds == 0) & (labels == 1))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1
+    }
+
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -272,7 +294,7 @@ def main(args):
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",  # Use F1 as the primary metric for model selection
+        metric_for_best_model="loss",  # Changed from f1 to loss since we need to ensure metrics are calculated properly first
         report_to=["wandb"],
     )
 
@@ -282,6 +304,7 @@ def main(args):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        compute_metrics=compute_metrics,  # Pass the compute_metrics function to the trainer
     )
 
     # Important: Set the aki_idx in the trainer to the correct value
