@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import os
 import argparse
 import pandas as pd
@@ -13,7 +14,7 @@ from utils import ForecastDFDataset
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
 import wandb
 
-# We'll define a helper mapping function to perform minute-pooling using average.
+# Helper function: Pooling per minute using average (with NaN handling)
 def pool_minute(df, pool_window=60):
     """
     Given a patient's DataFrame (each row is one second, columns are measures),
@@ -34,13 +35,21 @@ def pool_minute(df, pool_window=60):
         pooled_row["Acute_kidney_injury"] = window.iloc[0]["Acute_kidney_injury"]
         pooled_row["time_idx"] = window["time_idx"].mean()
         for col in feature_cols:
-            pooled_row[col] = np.nanmean(window[col])
+            valid_vals = window[col].dropna()
+            if len(valid_vals) == 0:
+                pooled_row[col] = np.nan
+            else:
+                pooled_row[col] = np.nanmean(window[col])
         pooled_data.append(pooled_row)
     return pd.DataFrame(pooled_data)
 
-# Optionally, if you want to truncate/pad to a fixed 3-hour duration in seconds,
-# you could add a helper function similar to the one defined previously.
+# Helper function: Truncate/pad a time series to fixed_length seconds
 def truncate_pad_series(df, fixed_length, pad_value=0):
+    """
+    For one patient's DataFrame df (assumed sorted by time_idx), truncate if length > fixed_length;
+    if length < fixed_length, pad with pad_value.
+    Returns a DataFrame with exactly fixed_length rows.
+    """
     current_length = len(df)
     if current_length >= fixed_length:
         return df.iloc[:fixed_length].copy()
@@ -52,13 +61,13 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
-# We now define a custom Dataset that uses the file paths
+# Custom Dataset that processes patient files on the fly
 class OnTheFlyForecastDFDataset(Dataset):
     def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
         """
         file_list: list of CSV file paths (one per patient)
         label_dict: dictionary mapping patient ID -> AKI label
-        process_mode: "pool" or "truncate" or "none"
+        process_mode: "pool", "truncate", or "none"
         pool_window: window (in seconds) for pooling
         fixed_length: fixed length (in seconds) if using "truncate" mode.
         """
@@ -73,50 +82,39 @@ class OnTheFlyForecastDFDataset(Dataset):
 
     def __getitem__(self, idx):
         csv_path = self.file_list[idx]
-        # Extract patient_id from filename, e.g., "R94565_combined.csv" -> "R94565"
         fname = os.path.basename(csv_path)
         patient_id = fname.split('_')[0]
         df = pd.read_csv(csv_path)
-        # Create a time index assuming rows are in order (one row per second)
+        # Create a time index (assumed one row per second)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
         df["Acute_kidney_injury"] = self.label_dict.get(patient_id, 0)
-        # Apply the transformation on the fly:
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
         elif self.process_mode == "pool":
             df = pool_minute(df, pool_window=self.pool_window)
-        # Otherwise, use raw df.
-        # Here, we expect df to be a DataFrame with fixed length time series.
-        # Convert the DataFrame into a dictionary (or leave as is) as required by ForecastDFDataset.
-        # For simplicity, we return the processed DataFrame.
+        # If process_mode is "none", use raw df.
         return df
 
-# We then assume that your utils.ForecastDFDataset supports a "map" function,
-# or you can wrap this OnTheFly dataset into your ForecastDFDataset.
-# For this example, we assume ForecastDFDataset accepts a list of patient DataFrames.
+# Collate function: Concatenate a list of patient DataFrames into one DataFrame
 def collate_patient_batches(batch):
-    """
-    Given a list of processed patient DataFrames (one per patient), collate them into one DataFrame.
-    """
     return pd.concat(batch, ignore_index=True)
 
 def main(args):
-    # Initialize wandb
+    # Initialize wandb for logging
     wandb.init(project="patchtst_aki", config=vars(args))
     
-    # Load labels from Excel
+    # Load AKI labels from Excel
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates()
     label_dict = dict(zip(df_labels["ID"], df_labels["Acute_kidney_injury"]))
     
-    # Get list of patient CSV file paths from data_dir
+    # Get list of patient CSV file paths
     file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir) if fname.endswith(".csv")]
-    
     if args.debug:
         file_list = file_list[:args.max_patients]
     
-    # Create the on-the-fly dataset (each item is a patient DataFrame)
+    # Create on-the-fly dataset
     dataset = OnTheFlyForecastDFDataset(
         file_list=file_list,
         label_dict=label_dict,
@@ -125,25 +123,23 @@ def main(args):
         fixed_length=args.fixed_length
     )
     
-    # Because each __getitem__ returns a patient DataFrame (with varying numbers of rows depending on process mode),
-    # we collate them into one big DataFrame.
-    # Alternatively, if your ForecastDFDataset supports mapping, you could integrate this step.
+    # Collate processed data for all patients into one DataFrame.
     all_patients_df = collate_patient_batches([dataset[i] for i in range(len(dataset))])
     
-    # Split by patient ID so that each patient remains intact.
+    # Split by patient ID to keep each patient's series intact.
     unique_ids = all_patients_df["ID"].unique()
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
     
-    # Determine feature columns: all numeric columns except ID, label, time_idx
+    # Determine feature columns: all numeric columns except ID, label, time_idx.
     feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     
     # Assume that after processing, every patient has the same number of rows.
     history_length = train_df.groupby("ID").size().max()
     
-    # Create ForecastDFDataset objects (from your utils)
+    # Create ForecastDFDataset objects using your utils.
     train_dataset = ForecastDFDataset(
         df=train_df,
         id_col="ID",
@@ -152,7 +148,7 @@ def main(args):
         history_length=history_length,
         forecast_length=1,
         time_varying_unknown_cols=feature_cols,
-        static_reals_cols=[],
+        static_reals_cols=[]
     )
     val_dataset = ForecastDFDataset(
         df=val_df,
@@ -162,10 +158,10 @@ def main(args):
         history_length=history_length,
         forecast_length=1,
         time_varying_unknown_cols=feature_cols,
-        static_reals_cols=[],
+        static_reals_cols=[]
     )
     
-    # Create Hugging Face Datasets using .to_dataloader() if available
+    # Convert to data loaders (assuming ForecastDFDataset.to_dataloader() exists)
     train_loader = train_dataset.to_dataloader(batch_size=args.batch_size, shuffle=True, mode="train")
     val_loader = val_dataset.to_dataloader(batch_size=args.batch_size, shuffle=False, mode="valid")
     
@@ -174,7 +170,7 @@ def main(args):
         num_input_channels=len(feature_cols),
         context_length=history_length,
         prediction_length=1,
-        num_targets=2,  # binary classification (0,1)
+        num_targets=2,  # binary classification: 0 and 1
         patch_length=args.patch_length,
         patch_stride=args.patch_stride,
         d_model=args.d_model,
@@ -183,7 +179,7 @@ def main(args):
     )
     model = PatchTSTForClassification(config)
     
-    # Set up TrainingArguments (wandb will capture logs automatically)
+    # Set up training arguments with WandB logging.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
@@ -196,6 +192,7 @@ def main(args):
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="loss",
+        report_to=["wandb"]
     )
     
     def compute_metrics(eval_pred):
@@ -214,7 +211,6 @@ def main(args):
     
     trainer.train()
     trainer.evaluate()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
