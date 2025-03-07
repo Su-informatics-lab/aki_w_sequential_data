@@ -26,9 +26,6 @@ from transformers.configuration_utils import PretrainedConfig
 # Fix JSON serialization by monkey-patching PretrainedConfig's to_dict method
 original_to_dict = PretrainedConfig.to_dict
 def patched_to_dict(self):
-    """
-    Convert numpy values to Python native types to ensure JSON serialization works
-    """
     output = original_to_dict(self)
     for key, value in output.items():
         if isinstance(value, np.integer):
@@ -38,15 +35,11 @@ def patched_to_dict(self):
         elif isinstance(value, np.ndarray):
             output[key] = value.tolist()
     return output
-
-# Apply the patch
 PretrainedConfig.to_dict = patched_to_dict
 
 def pool_minute(df, pool_window=60):
     """
-    Given a patient's DataFrame (each row is one second, columns are measures),
-    pool over non-overlapping windows of size pool_window (in seconds) using average,
-    ignoring NaNs. Returns a new DataFrame with pooled rows.
+    Pool over non-overlapping windows of size pool_window using average (ignoring NaNs).
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
     feature_cols = [col for col in df.columns
@@ -73,8 +66,7 @@ def pool_minute(df, pool_window=60):
 
 def truncate_pad_series(df, fixed_length, pad_value=0):
     """
-    Truncate df if its length is greater than fixed_length; if shorter, pad with pad_value.
-    Returns a DataFrame with exactly fixed_length rows.
+    Truncate or pad df to exactly fixed_length rows.
     """
     current_length = len(df)
     if current_length >= fixed_length:
@@ -87,46 +79,12 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
-def calculate_class_weights(labels):
-    """
-    Calculate class weights based on the inverse of class frequencies.
-    This gives more weight to underrepresented classes.
-
-    Args:
-        labels (array-like): Array of class labels
-
-    Returns:
-        torch.Tensor: Class weights tensor
-    """
-    # Count frequency of each class
-    counts = np.bincount(labels)
-
-    # Option 1: Inverse frequency weighting
-    weights = 1.0 / counts
-
-    # Option 2: Inverse square root frequency weighting (smoother)
-    # weights = 1.0 / np.sqrt(counts)
-
-    # Option 3: Effective number of samples weighting
-    # beta = 0.9999
-    # weights = (1.0 - beta) / (1.0 - beta ** counts)
-
-    # Normalize weights so they sum to the number of classes
-    weights = weights * len(counts) / weights.sum()
-
-    print(f"Class distribution: {counts}")
-    print(f"Calculated class weights: {weights}")
-
-    return torch.tensor(weights, dtype=torch.float)
-
 class OnTheFlyForecastDFDataset(Dataset):
     def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
         """
-        file_list: list of CSV file paths (one per patient)
-        label_dict: dictionary mapping patient ID -> AKI label
-        process_mode: "pool", "truncate", or "none"
-        pool_window: window (in seconds) for pooling
-        fixed_length: fixed length (in seconds) if using "truncate" mode.
+        file_list: list of CSV file paths.
+        label_dict: dict mapping patient ID -> AKI label.
+        process_mode: "pool", "truncate", or "none".
         """
         self.file_list = file_list
         self.label_dict = label_dict
@@ -154,114 +112,49 @@ class OnTheFlyForecastDFDataset(Dataset):
 
 def collate_patient_batches(batch):
     """
-    Given a list of processed patient DataFrames (one per patient), collate them into one DataFrame.
+    Collate a list of processed patient DataFrames into one DataFrame.
     """
     return pd.concat(batch, ignore_index=True)
-
-# Define a compute_metrics function for evaluation
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    accuracy = (preds == labels).mean()
-
-    # Class counts for debugging
-    class_counts = np.bincount(labels, minlength=2)
-    pred_counts = np.bincount(preds, minlength=2)
-    print(f"Evaluation: Class distribution in labels: {class_counts}")
-    print(f"Evaluation: Class distribution in predictions: {pred_counts}")
-
-    # Add precision, recall, F1 for the positive class (AKI=1)
-    tp = np.sum((preds == 1) & (labels == 1))
-    fp = np.sum((preds == 1) & (labels == 0))
-    fn = np.sum((preds == 0) & (labels == 1))
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-    # Print confusion matrix for better understanding
-    print("Confusion Matrix:")
-    print(f"TN: {np.sum((preds == 0) & (labels == 0))}, FP: {fp}")
-    print(f"FN: {fn}, TP: {tp}")
-
-    # Convert any numpy types to Python native types
-    return {
-        "accuracy": float(accuracy),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1)
-    }
 
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
     def __init__(self, *args, **kwargs):
-        self.class_weights = kwargs.pop("class_weights", None)
         super().__init__(*args, **kwargs)
-        # Initialize aki_idx which will be set in main()
         self.aki_idx = 0
+        self.class_weights = None  # Will be set in main()
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Get past_values from inputs
-        past_values = inputs.get("past_values")
-
-        if past_values is None:
-            # Print all available keys for debugging
-            print("Available keys in inputs:", list(inputs.keys()))
-            raise ValueError("past_values not found in inputs. Cannot extract labels for training.")
-
-        # Extract labels from the last timestep of the past_values tensor at the AKI index
-        labels = past_values[:, -1, self.aki_idx].long()
-
-        # Forward pass
+        # Remove 'labels' if present.
+        if "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = inputs["past_values"][:, -1, 0].long()
         outputs = model(**inputs)
-
-        # Compute weighted loss if class weights are provided
         if self.class_weights is not None:
-            weights = self.class_weights.to(labels.device)
-            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=weights)
+            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device))
         else:
             loss = F.cross_entropy(outputs.prediction_logits, labels)
-
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
-
         with torch.no_grad():
-            # Get past_values from inputs
-            past_values = inputs.get("past_values")
-
-            if past_values is None:
-                raise ValueError("past_values not found in inputs during prediction step")
-
-            # Extract labels from the last timestep of the past_values tensor
-            labels = past_values[:, -1, self.aki_idx].long()
-
-            # Forward pass
-            outputs = model(**inputs)
-
-            # Return loss, logits, and labels
-            if self.class_weights is not None:
-                weights = self.class_weights.to(labels.device)
-                loss = F.cross_entropy(outputs.prediction_logits, labels, weight=weights)
+            if "labels" in inputs:
+                labels = inputs.pop("labels")
             else:
-                loss = F.cross_entropy(outputs.prediction_logits, labels)
-
+                labels = inputs["past_values"][:, -1, 0].long()
+            outputs = model(**inputs)
+            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device) if self.class_weights is not None else None)
             return (loss, outputs.prediction_logits, labels)
 
 # --- Main function ---
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
 
-    # Load AKI labels from Excel and drop rows with NaN in the label column.
+    # Load AKI labels from Excel and drop NaN rows.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = dict(zip(df_labels["ID"], df_labels["Acute_kidney_injury"]))
-
-    # Analyze class distribution in the whole dataset
-    aki_values = np.array(list(label_dict.values()))
-    print(f"Overall AKI distribution: {np.bincount(aki_values)}")
-    print(f"Percentage of AKI positive: {100 * np.mean(aki_values):.2f}%")
 
     preprocessed_path = args.preprocessed_path
     if os.path.exists(preprocessed_path):
@@ -296,7 +189,7 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
 
-    # Debug prints: show columns in preprocessed data.
+    # Debug print: show columns in preprocessed data.
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
     # Split by patient ID so that each patient's series remains intact.
@@ -305,10 +198,6 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Calculate class weights for the training set
-    train_labels = train_df[train_df["ID"].isin(train_ids)]["Acute_kidney_injury"].values
-    class_weights = calculate_class_weights(train_labels)
-
     # Determine feature columns: numeric columns except ID, Acute_kidney_injury, time_idx.
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
@@ -316,19 +205,19 @@ def main(args):
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # Create combined input columns. Here we join the target column with feature_cols.
+    # Create combined input columns (include target) and print.
     combined_x_cols = sorted(list(set(["Acute_kidney_injury"] + feature_cols)))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
 
-    # Find the index of Acute_kidney_injury in the combined_x_cols list
+    # Find index of Acute_kidney_injury in the combined list.
     aki_index = combined_x_cols.index("Acute_kidney_injury")
     print(f"Debug - Acute_kidney_injury is at index {aki_index} in combined_x_cols")
 
     history_length = train_df.groupby("ID").size().max()
     print(f"History length (number of rows per patient): {history_length}")
 
-    # Create ForecastDFDataset objects using the proper parameter names.
+    # Create ForecastDFDataset objects.
     train_dataset = ForecastDFDataset(
         data=train_df,
         id_columns=["ID"],
@@ -348,10 +237,28 @@ def main(args):
         prediction_length=1,
     )
 
-    # Convert values in the configuration to native Python types
-    # This is essential to avoid JSON serialization issues
+    # Wrap datasets with torch DataLoader.
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    # Compute class weights from the training labels.
+    labels_train = train_df["Acute_kidney_injury"].values
+    unique, counts = np.unique(labels_train, return_counts=True)
+    print("Training label distribution:", dict(zip(unique, counts)))
+    num_classes = 2
+    weight_list = []
+    for i in range(num_classes):
+        freq = counts[unique == i]
+        if freq.size > 0:
+            weight_list.append(1.0 / freq[0])
+        else:
+            weight_list.append(0.0)
+    class_weights = torch.tensor(weight_list, dtype=torch.float)
+    print("Computed class weights (inverse frequency):", class_weights)
+
+    # Create PatchTST configuration with Python native types.
     config_dict = {
-        "num_input_channels": int(len(combined_x_cols)),
+        "num_input_channels": int(len(combined_x_cols)),  # expecting 27 channels
         "context_length": int(history_length),
         "prediction_length": 1,
         "num_targets": 2,
@@ -361,12 +268,9 @@ def main(args):
         "num_hidden_layers": int(args.num_hidden_layers),
         "num_attention_heads": int(args.num_attention_heads),
     }
-
-    # Create the config with Python native types
     config = PatchTSTConfig(**config_dict)
     model = PatchTSTForClassification(config)
 
-    # Create training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
@@ -378,45 +282,57 @@ def main(args):
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1" if args.use_f1 else "loss",  # Can choose f1 or loss for model selection
+        metric_for_best_model="loss",
         report_to=["wandb"],
     )
 
-    # Create trainer and set the aki_idx
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        accuracy = (preds == labels).mean()
+        tp = np.sum((preds == 1) & (labels == 1))
+        fp = np.sum((preds == 1) & (labels == 0))
+        fn = np.sum((preds == 0) & (labels == 1))
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        return {
+            "accuracy": float(accuracy),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1)
+        }
+
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
-        class_weights=class_weights if args.use_class_weights else None,
     )
-
-    # Important: Set the aki_idx in the trainer to the correct value
+    # Set the aki_idx in the trainer.
     trainer.aki_idx = aki_index
     print(f"Setting aki_idx in CustomTrainer to {aki_index}")
-    print(f"Using class weights: {args.use_class_weights}")
 
-    # Disable saving if there are issues with it
+    # Set class weights in the trainer for weighted loss.
+    trainer.class_weights = class_weights
+
+    # Optionally disable saving if requested.
     if args.no_save:
         print("Saving is disabled")
-        training_args.save_steps = 1e9  # Set to a very large number to effectively disable saving
+        training_args.save_steps = 1e9
         training_args.save_total_limit = 0
 
     trainer.train()
 
     if not args.no_save:
-        # Save model explicitly with proper error handling
         try:
-            trainer.save_model(args.output_dir + "/final_model")
-            print(f"Model saved successfully to {args.output_dir}/final_model")
+            trainer.save_model(os.path.join(args.output_dir, "final_model"))
+            print(f"Model saved successfully to {os.path.join(args.output_dir, 'final_model')}")
         except Exception as e:
             print(f"Error saving model: {e}")
 
-    # Final evaluation
-    print("\nFinal Evaluation Results:")
-    eval_results = trainer.evaluate()
-    print(eval_results)
+    trainer.evaluate()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -447,10 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
-    parser.add_argument("--no_save", action="store_true", help="Disable model saving to avoid JSON serialization issues.")
-    parser.add_argument("--use_class_weights", action="store_true",
-                        help="Use class weights for handling imbalanced data.")
-    parser.add_argument("--use_f1", action="store_true",
-                        help="Use F1 score instead of loss for model selection.")
+    parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
+
     args = parser.parse_args()
     main(args)
