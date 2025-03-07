@@ -144,7 +144,7 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
 
-    # Debug: print all column names from the preprocessed data.
+    # Debug print: show all columns in preprocessed data.
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
     # Split by patient ID so that each patient's series remains intact.
@@ -154,10 +154,17 @@ def main(args):
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
     # Determine feature columns: numeric columns except ID, Acute_kidney_injury, time_idx.
-    feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
+    feature_cols = [col for col in all_patients_df.columns
+                    if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
+
+    # Because ForecastDFDataset joins target_columns with observable_columns,
+    # our effective input channels will be:
+    combined_x_cols = list(set(["Acute_kidney_injury"] + feature_cols))
+    print("Combined input columns (x_cols):", combined_x_cols)
+    print("Number of input channels for dataset:", len(combined_x_cols))
 
     history_length = train_df.groupby("ID").size().max()
     print(f"History length (number of rows per patient): {history_length}")
@@ -188,7 +195,7 @@ def main(args):
 
     # Configure PatchTST model for classification.
     config = PatchTSTConfig(
-        num_input_channels=len(feature_cols),
+        num_input_channels=len(combined_x_cols),  # use combined_x_cols length (27 in your case)
         context_length=history_length,
         prediction_length=1,
         num_targets=2,  # binary classification: 0 and 1
@@ -243,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--process_mode", type=str, choices=["truncate", "pool", "none"], default="pool",
                         help="Preprocessing mode: 'truncate' to pad/truncate, 'pool' for minute pooling, or 'none'.")
     parser.add_argument("--fixed_length", type=int, default=10800,
-                        help="Fixed length if using 'truncate' mode (e.g., 10800 for 3 hours at 1-sec resolution).")
+                        help="Fixed length if using 'truncate' mode (e.g., 10800 for 3 hours at 1-second resolution).")
     parser.add_argument("--pool_window", type=int, default=60,
                         help="Window size for pooling (e.g., 60 seconds).")
     parser.add_argument("--pool_method", type=str, choices=["average", "max", "median"], default="average",
