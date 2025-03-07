@@ -106,83 +106,56 @@ def collate_patient_batches(batch):
 
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Store the aki_idx value once to ensure consistency throughout the training
+        # This value will be updated in main() with the correct index
+        self.aki_idx = None
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # In ForecastDFDataset, one of the batch items should contain the target column
-        # We need to find where the Acute_kidney_injury values are stored
-
-        # Print keys in inputs to debug what's available
-        print("Debug - Keys in inputs:", list(inputs.keys()))
-
-        # Find the AKI column in inputs
-        # Option 1: Try to get AKI from past_values since it contains all columns
+        # Get past_values from inputs
         past_values = inputs.get("past_values")
-        if past_values is not None:
-            print("Debug - past_values shape:", past_values.shape)
 
-            # From the combined_x_cols log, Acute_kidney_injury is at index 19
-            aki_idx = 19  # Updated based on the latest log
+        if past_values is None:
+            # Print all available keys for debugging
+            print("Available keys in inputs:", list(inputs.keys()))
+            raise ValueError("past_values not found in inputs. Cannot extract labels for training.")
 
-            # Extract the last timestep's AKI value for each sample
-            # This is making the assumption that the last value is the label we want
-            labels = past_values[:, -1, aki_idx].long()
+        # Print shape for debugging (only for first few batches)
+        if torch.rand(1).item() < 0.01:  # Only print for ~1% of batches to avoid log spam
+            print(f"DEBUG - past_values shape: {past_values.shape}")
 
-            # Debug print
-            print(f"Debug - Extracted {len(labels)} labels from past_values")
-            print(f"Debug - Label distribution: {torch.bincount(labels)}")
+        # Extract labels from the last timestep of the past_values tensor
+        labels = past_values[:, -1, self.aki_idx].long()
+
+        # Forward pass
+        outputs = model(**inputs)
+
+        # Compute loss
+        loss = F.cross_entropy(outputs.prediction_logits, labels)
+
+        return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+
+        with torch.no_grad():
+            # Get past_values from inputs
+            past_values = inputs.get("past_values")
+
+            if past_values is None:
+                raise ValueError("past_values not found in inputs during prediction step")
+
+            # Extract labels from the last timestep of the past_values tensor
+            labels = past_values[:, -1, self.aki_idx].long()
 
             # Forward pass
             outputs = model(**inputs)
 
-            # Compute cross-entropy loss using prediction_logits
+            # Return loss, logits, and labels
             loss = F.cross_entropy(outputs.prediction_logits, labels)
 
-            return (loss, outputs) if return_outputs else loss
-        else:
-            raise ValueError("past_values not found in inputs. Cannot extract labels for training.")
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        # We need to override this to handle label extraction for evaluation too
-        inputs = self._prepare_inputs(inputs)
-
-        with torch.no_grad():
-            # Extract labels
-            past_values = inputs.get("past_values")
-            aki_idx = 19  # Same index as in compute_loss
-
-            if past_values is not None:
-                labels = past_values[:, -1, aki_idx].long()
-
-                # Forward pass
-                outputs = model(**inputs)
-
-                # Compute loss
-                loss = F.cross_entropy(outputs.prediction_logits, labels)
-
-                return (loss, outputs.prediction_logits, labels)
-            else:
-                raise ValueError("past_values not found in inputs during prediction step")
-
-    def compute_metrics(self, eval_pred):
-        # This will be used in the Trainer instead of the standalone compute_metrics function
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        accuracy = (preds == labels).mean()
-
-        # Add precision, recall, F1 for the positive class (AKI=1)
-        tp = np.sum((preds == 1) & (labels == 1))
-        fp = np.sum((preds == 1) & (labels == 0))
-        fn = np.sum((preds == 0) & (labels == 1))
-
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-        return {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
-        }
+            return (loss, outputs.prediction_logits, labels)
 
 # --- Main function ---
 def main(args):
@@ -243,7 +216,7 @@ def main(args):
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
     # Create combined input columns. Here we join the target column with feature_cols.
-    combined_x_cols = list(set(["Acute_kidney_injury"] + feature_cols))
+    combined_x_cols = sorted(list(set(["Acute_kidney_injury"] + feature_cols)))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
 
@@ -303,12 +276,19 @@ def main(args):
         report_to=["wandb"],
     )
 
+    # Create trainer and set the aki_idx
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
     )
+
+    # Important: Set the aki_idx in the trainer to the correct value
+    trainer.aki_idx = aki_index
+
+    # Print confirmation
+    print(f"Setting aki_idx in CustomTrainer to {aki_index}")
 
     trainer.train()
     trainer.evaluate()
