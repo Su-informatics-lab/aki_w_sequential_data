@@ -237,13 +237,17 @@ def main(args):
 
     # Load AKI labels from Excel and drop rows with NaN labels.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
-    df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
-    # Convert keys to strings and strip whitespace.
-    label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
+    df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(
+        subset=["Acute_kidney_injury"])
+    label_dict = {str(x).strip(): y for x, y in
+                  zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
 
     # Filter file list: only include CSV files whose patient ID is present in label_dict.
-    file_list = [os.path.join(args.data_dir, fname) for fname in os.listdir(args.data_dir)
-                 if fname.endswith(".csv") and fname.split('_')[0].strip() in label_dict]
+    file_list = [
+        os.path.join(args.data_dir, fname)
+        for fname in os.listdir(args.data_dir)
+        if fname.endswith(".csv") and fname.split('_')[0].strip() in label_dict
+    ]
     if args.debug:
         file_list = file_list[:args.max_patients]
 
