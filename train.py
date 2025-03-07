@@ -23,7 +23,7 @@ def pool_minute(df, pool_window=60):
     """
     Given a patient's DataFrame (each row is one second, columns are measures),
     pool over non-overlapping windows of size pool_window (in seconds) using average,
-    ignoring NaNs. Returns a new DataFrame.
+    ignoring NaNs. Returns a new DataFrame with pooled rows.
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
     feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
@@ -88,6 +88,7 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
+        # Cast label to int and drop NaNs by default from label_dict
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, 0))
         if self.process_mode == "truncate":
             df = truncate_pad_series(df, fixed_length=self.fixed_length)
@@ -153,10 +154,13 @@ def main(args):
     # Determine feature columns: numeric columns except ID, Acute_kidney_injury, time_idx.
     feature_cols = [col for col in all_patients_df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
+    # Remove any extra columns that start with "Unnamed"
+    feature_cols = [col for col in feature_cols if not col.startswith("Unnamed")]
+    print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
     history_length = train_df.groupby("ID").size().max()
 
-    # Create ForecastDFDataset objects (using the proper parameter names).
+    # Create ForecastDFDataset objects using the proper parameter names.
     train_dataset = ForecastDFDataset(
         data=train_df,
         id_columns=["ID"],
