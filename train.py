@@ -34,7 +34,7 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only the observable signals (26 channels) are used as input)   |
+|  (Only the observable signals are used as input to PatchTST)     |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
@@ -194,23 +194,24 @@ class ClassificationDataset(Dataset):
     A wrapper around ForecastDFDataset for classification.
     It adds a static label "labels" to each example based on the patient ID.
     """
-    def __init__(self, base_dataset, label_mapping):
+    def __init__(self, base_dataset, label_mapping, debug=False):
         self.base_dataset = base_dataset
         # Ensure keys in label_mapping are strings and stripped.
         self.label_mapping = {str(k).strip(): v for k, v in label_mapping.items()}
+        self.debug = debug
 
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Try to get patient ID from key "id" first, then "ID"
+        # Try "id" then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
         elif "ID" in example:
             patient_id = example["ID"]
-        else:
+        if patient_id is None:
             raise KeyError("No patient ID found in example.")
         if isinstance(patient_id, (tuple, list)):
             patient_id = str(patient_id[0]).strip()
@@ -219,8 +220,11 @@ class ClassificationDataset(Dataset):
         if patient_id not in self.label_mapping:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
-        # (Optional) Uncomment the next line to debug a sample:
-        # print(f"Example {idx} for patient {patient_id} with label {example['labels']}")
+        if self.debug and idx == 0:
+            print(f"[DEBUG] Example keys: {list(example.keys())}")
+            if "past_values" in example:
+                print(f"[DEBUG] past_values shape: {example['past_values'].shape}")
+            print(f"[DEBUG] labels: {example['labels']}")
         return example
 
 # --- Custom Trainer Subclass ---
@@ -337,8 +341,17 @@ def main(args):
         prediction_length=1,
     )
     # Wrap these with ClassificationDataset to add the static AKI label.
-    train_dataset = ClassificationDataset(base_train_dataset, label_dict)
-    val_dataset = ClassificationDataset(base_val_dataset, label_dict)
+    # Enable debug prints in ClassificationDataset if args.debug is True.
+    train_dataset = ClassificationDataset(base_train_dataset, label_dict, debug=args.debug)
+    val_dataset = ClassificationDataset(base_val_dataset, label_dict, debug=args.debug)
+
+    # (Optional) Print a sample from the training dataset for debugging.
+    if args.debug and len(train_dataset) > 0:
+        sample = train_dataset[0]
+        print("[DEBUG] Sample training example keys:", list(sample.keys()))
+        if "past_values" in sample:
+            print("[DEBUG] past_values shape:", sample["past_values"].shape)
+        print("[DEBUG] labels:", sample["labels"])
 
     # Create DataLoaders.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
