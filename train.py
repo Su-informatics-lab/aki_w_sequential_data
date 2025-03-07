@@ -18,8 +18,29 @@ from utils import ForecastDFDataset
 
 # Import PatchTST classes from Hugging Face Transformers.
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
+from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
 
 # --- Helper Functions ---
+
+# Fix JSON serialization by monkey-patching PretrainedConfig's to_dict method
+original_to_dict = PretrainedConfig.to_dict
+def patched_to_dict(self):
+    """
+    Convert numpy values to Python native types to ensure JSON serialization works
+    """
+    output = original_to_dict(self)
+    for key, value in output.items():
+        if isinstance(value, np.integer):
+            output[key] = int(value)
+        elif isinstance(value, np.floating):
+            output[key] = float(value)
+        elif isinstance(value, np.ndarray):
+            output[key] = value.tolist()
+    return output
+
+# Apply the patch
+PretrainedConfig.to_dict = patched_to_dict
 
 def pool_minute(df, pool_window=60):
     """
@@ -105,18 +126,76 @@ def collate_patient_batches(batch):
     """
     return pd.concat(batch, ignore_index=True)
 
+# Define a compute_metrics function for evaluation
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    accuracy = (preds == labels).mean()
+
+    # Add precision, recall, F1 for the positive class (AKI=1)
+    tp = np.sum((preds == 1) & (labels == 1))
+    fp = np.sum((preds == 1) & (labels == 0))
+    fn = np.sum((preds == 0) & (labels == 1))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Convert any numpy types to Python native types
+    return {
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1)
+    }
+
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize aki_idx which will be set in main()
+        self.aki_idx = 0
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove 'labels' from inputs if present
-        if "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            # If not provided, use the last timestep of past_values as labels.
-            labels = inputs["past_values"][:, -1, 0].long()
+        # Get past_values from inputs
+        past_values = inputs.get("past_values")
+
+        if past_values is None:
+            # Print all available keys for debugging
+            print("Available keys in inputs:", list(inputs.keys()))
+            raise ValueError("past_values not found in inputs. Cannot extract labels for training.")
+
+        # Extract labels from the last timestep of the past_values tensor at the AKI index
+        labels = past_values[:, -1, self.aki_idx].long()
+
+        # Forward pass
         outputs = model(**inputs)
+
+        # Compute loss
         loss = F.cross_entropy(outputs.prediction_logits, labels)
+
         return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+
+        with torch.no_grad():
+            # Get past_values from inputs
+            past_values = inputs.get("past_values")
+
+            if past_values is None:
+                raise ValueError("past_values not found in inputs during prediction step")
+
+            # Extract labels from the last timestep of the past_values tensor
+            labels = past_values[:, -1, self.aki_idx].long()
+
+            # Forward pass
+            outputs = model(**inputs)
+
+            # Return loss, logits, and labels
+            loss = F.cross_entropy(outputs.prediction_logits, labels)
+
+            return (loss, outputs.prediction_logits, labels)
 
 # --- Main function ---
 def main(args):
@@ -176,12 +255,12 @@ def main(args):
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # Create combined input columns (include target) and print for debugging.
+    # Create combined input columns. Here we join the target column with feature_cols.
     combined_x_cols = sorted(list(set(["Acute_kidney_injury"] + feature_cols)))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
 
-    # Find the index of Acute_kidney_injury in the combined_x_cols list.
+    # Find the index of Acute_kidney_injury in the combined_x_cols list
     aki_index = combined_x_cols.index("Acute_kidney_injury")
     print(f"Debug - Acute_kidney_injury is at index {aki_index} in combined_x_cols")
 
@@ -208,24 +287,25 @@ def main(args):
         prediction_length=1,
     )
 
-    # Wrap datasets with torch DataLoader.
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Convert values in the configuration to native Python types
+    # This is essential to avoid JSON serialization issues
+    config_dict = {
+        "num_input_channels": int(len(combined_x_cols)),
+        "context_length": int(history_length),
+        "prediction_length": 1,
+        "num_targets": 2,
+        "patch_length": int(args.patch_length),
+        "patch_stride": int(args.patch_stride),
+        "d_model": int(args.d_model),
+        "num_hidden_layers": int(args.num_hidden_layers),
+        "num_attention_heads": int(args.num_attention_heads),
+    }
 
-    # Configure PatchTST model for classification.
-    config = PatchTSTConfig(
-        num_input_channels=len(combined_x_cols),  # Expecting 27 channels.
-        context_length=history_length,
-        prediction_length=1,
-        num_targets=2,  # binary classification: 0 and 1.
-        patch_length=args.patch_length,
-        patch_stride=args.patch_stride,
-        d_model=args.d_model,
-        num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.num_attention_heads,
-    )
+    # Create the config with Python native types
+    config = PatchTSTConfig(**config_dict)
     model = PatchTSTForClassification(config)
 
+    # Create training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
@@ -241,24 +321,7 @@ def main(args):
         report_to=["wandb"],
     )
 
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        accuracy = (preds == labels).mean()
-        # Compute additional metrics for the positive class.
-        tp = np.sum((preds == 1) & (labels == 1))
-        fp = np.sum((preds == 1) & (labels == 0))
-        fn = np.sum((preds == 0) & (labels == 1))
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        return {
-            "accuracy": float(accuracy),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1)
-        }
-
+    # Create trainer and set the aki_idx
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -267,35 +330,27 @@ def main(args):
         compute_metrics=compute_metrics,
     )
 
-    # Set aki_idx in our custom trainer.
+    # Important: Set the aki_idx in the trainer to the correct value
     trainer.aki_idx = aki_index
     print(f"Setting aki_idx in CustomTrainer to {aki_index}")
 
+    # Disable saving if there are issues with it
+    if args.no_save:
+        print("Saving is disabled")
+        training_args.save_steps = 1e9  # Set to a very large number to effectively disable saving
+        training_args.save_total_limit = 0
+
     trainer.train()
+
+    if not args.no_save:
+        # Save model explicitly with proper error handling
+        try:
+            trainer.save_model(args.output_dir + "/final_model")
+            print(f"Model saved successfully to {args.output_dir}/final_model")
+        except Exception as e:
+            print(f"Error saving model: {e}")
+
     trainer.evaluate()
-
-# --- Custom Trainer Subclass ---
-class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove "labels" from inputs if present.
-        if "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = inputs["past_values"][:, -1, 0].long()
-        outputs = model(**inputs)
-        loss = F.cross_entropy(outputs.prediction_logits, labels)
-        return (loss, outputs) if return_outputs else loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        inputs = self._prepare_inputs(inputs)
-        with torch.no_grad():
-            if "labels" in inputs:
-                labels = inputs.pop("labels")
-            else:
-                labels = inputs["past_values"][:, -1, 0].long()
-            outputs = model(**inputs)
-            loss = F.cross_entropy(outputs.prediction_logits, labels)
-            return (loss, outputs.prediction_logits, labels)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -326,6 +381,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
+    parser.add_argument("--no_save", action="store_true", help="Disable model saving to avoid JSON serialization issues.")
 
     args = parser.parse_args()
     main(args)
