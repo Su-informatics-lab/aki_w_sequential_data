@@ -12,12 +12,19 @@ import pyarrow.parquet as pq
 import wandb
 import torch.nn.functional as F
 import json
+from sklearn.metrics import roc_auc_score
 
 # Import your ForecastDFDataset from utils.
 from utils import ForecastDFDataset
 
-# Import PatchTST classes from Hugging Face Transformers.
-from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
+# Import PatchTST classes and EarlyStoppingCallback from Hugging Face Transformers.
+from transformers import (
+    PatchTSTConfig,
+    PatchTSTForClassification,
+    Trainer,
+    TrainingArguments,
+    EarlyStoppingCallback,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 
@@ -83,7 +90,7 @@ class OnTheFlyForecastDFDataset(Dataset):
     def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, fixed_length=10800):
         """
         file_list: list of CSV file paths.
-        label_dict: dict mapping patient ID -> AKI label.
+        label_dict: dictionary mapping patient ID -> AKI label.
         process_mode: "pool", "truncate", or "none".
         """
         self.file_list = file_list
@@ -121,10 +128,10 @@ class CustomTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.aki_idx = 0
-        self.class_weights = None  # Will be set in main()
+        self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Remove 'labels' if present.
+        # Remove "labels" if present.
         if "labels" in inputs:
             labels = inputs.pop("labels")
         else:
@@ -151,7 +158,7 @@ class CustomTrainer(Trainer):
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
 
-    # Load AKI labels from Excel and drop NaN rows.
+    # Load AKI labels from Excel and drop rows with NaN labels.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = dict(zip(df_labels["ID"], df_labels["Acute_kidney_injury"]))
@@ -189,28 +196,27 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         print(f"Preprocessed data saved to {preprocessed_path}.")
 
-    # Debug print: show columns in preprocessed data.
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # Split by patient ID so that each patient's series remains intact.
+    # Split data by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    # Determine feature columns: numeric columns except ID, Acute_kidney_injury, time_idx.
+    # Determine feature columns (exclude ID, label, time_idx).
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
 
-    # Create combined input columns (include target) and print.
+    # Combined input columns (target + features).
     combined_x_cols = sorted(list(set(["Acute_kidney_injury"] + feature_cols)))
     print("Combined input columns (x_cols):", combined_x_cols)
     print("Number of input channels for dataset:", len(combined_x_cols))
 
-    # Find index of Acute_kidney_injury in the combined list.
+    # Find index of target in combined_x_cols.
     aki_index = combined_x_cols.index("Acute_kidney_injury")
     print(f"Debug - Acute_kidney_injury is at index {aki_index} in combined_x_cols")
 
@@ -237,11 +243,11 @@ def main(args):
         prediction_length=1,
     )
 
-    # Wrap datasets with torch DataLoader.
+    # Wrap datasets with DataLoader.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # Compute class weights from the training labels.
+    # Compute class weights using inverse frequency.
     labels_train = train_df["Acute_kidney_injury"].values
     unique, counts = np.unique(labels_train, return_counts=True)
     print("Training label distribution:", dict(zip(unique, counts)))
@@ -256,9 +262,9 @@ def main(args):
     class_weights = torch.tensor(weight_list, dtype=torch.float)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    # Create PatchTST configuration with Python native types.
+    # Create PatchTST configuration.
     config_dict = {
-        "num_input_channels": int(len(combined_x_cols)),  # expecting 27 channels
+        "num_input_channels": int(len(combined_x_cols)),  # Expecting 27 channels.
         "context_length": int(history_length),
         "prediction_length": 1,
         "num_targets": 2,
@@ -271,6 +277,7 @@ def main(args):
     config = PatchTSTConfig(**config_dict)
     model = PatchTSTForClassification(config)
 
+    # Create training arguments with a lower learning rate.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
@@ -279,6 +286,7 @@ def main(args):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
+        learning_rate=1e-5,  # Lower initial learning rate.
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
@@ -296,31 +304,34 @@ def main(args):
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        try:
+            auc = roc_auc_score(labels, preds)
+        except Exception:
+            auc = 0.0
         return {
             "accuracy": float(accuracy),
             "precision": float(precision),
             "recall": float(recall),
-            "f1": float(f1)
+            "f1": float(f1),
+            "auc": float(auc),
         }
 
+    # Create our custom trainer and set class weights and aki index.
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
-    # Set the aki_idx in the trainer.
     trainer.aki_idx = aki_index
+    trainer.class_weights = class_weights
     print(f"Setting aki_idx in CustomTrainer to {aki_index}")
 
-    # Set class weights in the trainer for weighted loss.
-    trainer.class_weights = class_weights
-
-    # Optionally disable saving if requested.
     if args.no_save:
         print("Saving is disabled")
-        training_args.save_steps = 1e9
+        training_args.save_steps = int(1e9)
         training_args.save_total_limit = 0
 
     trainer.train()
