@@ -72,6 +72,19 @@ def ts_padding(
     return new_df
 
 
+def np_to_torch(data: np.array, float_type=np.float32):
+    if data.dtype == "float":
+        return torch.from_numpy(data.astype(float_type))
+    elif data.dtype == "int":
+        return torch.from_numpy(data)
+    elif data.dtype == "bool":
+        return torch.from_numpy(data)
+    return torch.from_numpy(data)
+
+
+def _torch(*nps):
+    return tuple(np_to_torch(x) for x in nps)
+
 def join_list_without_repeat(*lists: List[List[Any]]) -> List[Any]:
     """Join multiple lists in sequence without repeating
 
