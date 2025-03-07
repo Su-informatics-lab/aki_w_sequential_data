@@ -11,6 +11,66 @@ import copy
 
 from transformers import PatchTSTConfig, PatchTSTForClassification, Trainer, TrainingArguments
 
+def ts_padding(
+    df: pd.DataFrame,
+    id_columns: Optional[List[str]] = None,
+    timestamp_column: Optional[str] = None,
+    context_length: int = 1,
+) -> pd.DataFrame:
+    """
+    Pad a dataframe, which is aware of time series conventions.
+
+    Check if df has length >= context_length.
+    If not, then fill (prepending) while preserving types and properly handling IDs and dates/timestamps. When
+    prepending dates, the sampling interval will be estimated, to create proper preceeding dates.
+
+    The assumption is the provided data contains only one id across the provided ID columns, the value will be
+    replicated in the prepended rows.
+
+    Args:
+        df (_type_): data frame
+        id_columns: List of strings representing columns containing ID information.
+        timestamp_column: str for column name containing timestamps.
+        context_length (int): required length
+
+    Returns:
+        Padded data frame
+    """
+    l = len(df)
+    if l >= context_length:
+        return df
+    fill_length = context_length - l  # why did we previously have + 1 here?
+
+    # create dataframe
+    pad_df = pd.DataFrame(np.zeros([fill_length, df.shape[1]]), columns=df.columns)
+
+    for c in df.columns:
+        if (id_columns and c in id_columns) or (c == timestamp_column):
+            continue
+        pad_df[c] = pad_df[c].astype(df.dtypes[c], copy=False)
+
+    if timestamp_column:
+        if len(df) < 2:
+            pad_df[timestamp_column] = None
+        elif (df[timestamp_column].dtype.type == np.datetime64) or (df[timestamp_column].dtype == int):
+            last_timestamp = df.iloc[0][timestamp_column]
+            period = df.iloc[1][timestamp_column] - df.iloc[0][timestamp_column]
+            prepended_timestamps = [last_timestamp + offset * period for offset in range(-fill_length, 0)]
+            pad_df[timestamp_column] = prepended_timestamps
+        else:
+            pad_df[timestamp_column] = None
+        # Ensure same type
+        pad_df[timestamp_column] = pad_df[timestamp_column].astype(df[timestamp_column].dtype)
+
+    if id_columns:
+        id_values = df.iloc[0][id_columns].to_list()
+        for id_column_name, id_column_value in zip(id_columns, id_values):
+            pad_df[id_column_name] = id_column_value
+
+    # combine the data
+    new_df = pd.concat([pad_df, df])
+    return new_df
+
 
 def join_list_without_repeat(*lists: List[List[Any]]) -> List[Any]:
     """Join multiple lists in sequence without repeating
