@@ -196,6 +196,15 @@ class AKITrainer(Trainer):
             inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
                                                   device=model_device)
 
+        # Debug logging: print unique target values for the first few evaluation batches
+        if not hasattr(self, "eval_batch_count"):
+            self.eval_batch_count = 0
+        self.eval_batch_count += 1
+        if self.eval_batch_count <= 3:  # only print for the first 3 batches
+            unique_vals = torch.unique(inputs["target_values"])
+            print(
+                f"[DEBUG] Evaluation Batch {self.eval_batch_count} target_values unique: {unique_vals.cpu().numpy()}")
+
         with torch.no_grad():
             target_values = inputs["target_values"].long()
             outputs = model(**inputs)
@@ -214,35 +223,28 @@ def compute_classification_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
 
-    # Check if we have only one class in the evaluation set
+    # Debug logging: print the unique labels present in the evaluation set
     unique_labels = np.unique(labels)
+    print(f"[DEBUG] In compute_classification_metrics, unique labels: {unique_labels}")
+
     if len(unique_labels) == 1:
         print(f"Warning: Only one class ({unique_labels[0]}) present in evaluation set")
         # For single-class evaluation, metrics need special handling
         accuracy = accuracy_score(labels, preds)
-
-        # If all predictions match the single class (perfect prediction)
         if np.array_equal(preds, labels):
             precision, recall, f1 = 1.0, 1.0, 1.0
         else:
-            # Some predictions are wrong - minority class is missing in true labels
-            # but predicted, or vice versa
-            precision = 0.0 if unique_labels[0] == 0 else 0.0
+            precision = 0.0
             recall = 0.0
             f1 = 0.0
-
-        # AUC is undefined for single-class, but we set to 0.5 (random chance)
-        auc = 0.5
+        auc = 0.5  # AUC undefined for single-class, so default to 0.5 (random chance)
     else:
-        # Normal case with multiple classes
         accuracy = accuracy_score(labels, preds)
         precision, recall, f1, _ = precision_recall_fscore_support(
             labels, preds, average='binary', zero_division=0
         )
-
         try:
-            # For ROC AUC, we need the probability scores instead of class predictions
-            # We get the probability of the positive class (class 1)
+            # Compute probability of the positive class (class 1)
             proba_pos = softmax(logits, axis=1)[:, 1]
             auc = roc_auc_score(labels, proba_pos)
         except Exception as e:
@@ -256,6 +258,7 @@ def compute_classification_metrics(eval_pred):
         "f1": float(f1),
         "auc": float(auc)
     }
+
 
 def softmax(x, axis=None):
     """Compute softmax values for each set of scores in x."""
