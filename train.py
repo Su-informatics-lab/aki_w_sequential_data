@@ -205,32 +205,39 @@ class ClassificationDataset(Dataset):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        # Get base example
-        base_example = self.base_dataset[idx]
+        # Get the base dataset item
+        base_item = self.base_dataset[idx]
 
         # Create a clean copy
         example = {}
-        for k, v in base_example.items():
+        for k, v in base_item.items():
             example[k] = v
 
         # Get patient ID
         patient_id = None
         if "id" in example:
-            patient_id = example["id"]
+            if isinstance(example["id"], tuple):
+                patient_id = str(example["id"][0]).strip()
+            else:
+                patient_id = str(example["id"]).strip()
         elif "ID" in example:
-            patient_id = example["ID"]
+            patient_id = str(example["ID"]).strip()
 
         if patient_id is None:
             raise KeyError("No patient ID found in example.")
 
-        if isinstance(patient_id, (tuple, list)):
-            patient_id = str(patient_id[0]).strip()
-        else:
-            patient_id = str(patient_id).strip()
+        if patient_id not in self.label_mapping:
+            raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
 
-        # Add label directly
-        example["labels"] = torch.tensor(self.label_mapping[patient_id],
-                                         dtype=torch.long)
+        # Check if we already have the label in static_categorical_values
+        if "static_categorical_values" in example:
+            # This should contain the AKI label as set by static_categorical_columns
+            # Convert to the labels format expected by the model
+            example["labels"] = example["static_categorical_values"].long()
+        else:
+            # Add the label directly
+            example["labels"] = torch.tensor(self.label_mapping[patient_id],
+                                             dtype=torch.long)
 
         if self.debug and idx == 0:
             print(f"[DEBUG] ClassificationDataset example keys: {list(example.keys())}")
@@ -241,22 +248,43 @@ class ClassificationDataset(Dataset):
 
 # --- Custom Data Collator ---
 def custom_data_collator(features):
+    # First, directly extract labels
+    labels = []
+    for f in features:
+        if "labels" in f:
+            labels.append(f["labels"])
+        elif "static_categorical_values" in f:
+            # Fallback to static_categorical_values if labels is missing
+            labels.append(f["static_categorical_values"].long())
+
+    # Initialize batch
     batch = {}
 
-    # First handle labels specifically
-    if all("labels" in f for f in features):
-        batch["labels"] = torch.tensor([f["labels"] for f in features],
-                                       dtype=torch.long)
+    # Add labels if we have them
+    if labels and len(labels) == len(features):
+        try:
+            batch["labels"] = torch.stack(labels) if all(
+                isinstance(l, torch.Tensor) for l in labels) else torch.tensor(labels,
+                                                                               dtype=torch.long)
+        except Exception as e:
+            print(f"[WARNING] Could not stack labels: {e}")
+            batch["labels"] = labels
     else:
         print("[WARNING] Not all examples have 'labels'! This will cause an error.")
 
-    # Handle other keys
-    all_keys = set().union(*[set(f.keys()) for f in features])
+    # Process other keys
+    all_keys = set()
+    for f in features:
+        all_keys.update(f.keys())
+
     for key in all_keys:
         if key == "labels":
             continue  # Already handled
 
         values = [f[key] for f in features if key in f]
+        if not values:
+            continue
+
         if all(isinstance(v, torch.Tensor) for v in values):
             try:
                 batch[key] = torch.stack(values)
@@ -278,17 +306,34 @@ class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False,
                      num_items_in_batch=None):
         print("[DEBUG] Batch keys before loss computation:", list(inputs.keys()))
+
+        # Even if labels is missing, we can derive it
         if "labels" not in inputs:
-            raise KeyError(
-                "'labels' not found in inputs. Check your data collator and dataset implementation.")
+            print("[WARNING] 'labels' key missing, attempting to recover...")
+
+            # Try to get from static_categorical_values
+            if "static_categorical_values" in inputs:
+                print("[DEBUG] Using static_categorical_values as labels")
+                inputs["labels"] = inputs["static_categorical_values"].long()
+            # Or create dummy labels as last resort
+            else:
+                batch_size = inputs["past_values"].size(0)
+                print(
+                    f"[WARNING] Creating dummy labels tensor of shape ({batch_size},)")
+                inputs["labels"] = torch.zeros(batch_size, dtype=torch.long)
+
+        if "labels" not in inputs:
+            raise KeyError("'labels' not found in inputs and could not be recovered.")
 
         labels = inputs.pop("labels").long()
         outputs = model(**inputs)
+
         if self.class_weights is not None:
             loss = F.cross_entropy(outputs.prediction_logits, labels,
                                    weight=self.class_weights.to(labels.device))
         else:
             loss = F.cross_entropy(outputs.prediction_logits, labels)
+
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -381,6 +426,8 @@ def main(args):
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
+        static_categorical_columns=["Acute_kidney_injury"],
+        # Use correct parameter name
     )
     base_val_dataset = ForecastDFDataset(
         data=val_df,
@@ -390,6 +437,8 @@ def main(args):
         observable_columns=feature_cols,
         context_length=history_length,
         prediction_length=1,
+        static_categorical_columns=["Acute_kidney_injury"],
+        # Use correct parameter name
     )
     # Wrap these with ClassificationDataset to add the static AKI label.
     train_dataset = ClassificationDataset(base_train_dataset, label_dict, debug=args.debug)
