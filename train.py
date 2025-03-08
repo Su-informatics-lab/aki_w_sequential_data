@@ -361,6 +361,9 @@ class CustomTrainer(Trainer):
 # --- Main function ---
 def main(args):
     wandb.init(project="patchtst_aki", config=vars(args))
+    device = torch.device(
+        f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    print(f"Using device: {device}")
 
     # Load AKI labels from Excel and drop rows with NaN labels.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
@@ -507,7 +510,7 @@ def main(args):
             weight_list.append(1.0 / freq[0])
         else:
             weight_list.append(0.0)
-    class_weights = torch.tensor(weight_list, dtype=torch.float)
+    class_weights = torch.tensor(weight_list, dtype=torch.float).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
 
     # Create PatchTST configuration using only observable features.
@@ -523,7 +526,7 @@ def main(args):
         "num_attention_heads": int(args.num_attention_heads),
     }
     config = PatchTSTConfig(**config_dict)
-    model = PatchTSTForClassification(config)
+    model = PatchTSTForClassification(config).to(device)
 
     # Create training arguments with a lower learning rate.
     training_args = TrainingArguments(
@@ -540,6 +543,9 @@ def main(args):
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         report_to=["wandb"],
+        # Add this to specify which device to use
+        no_cuda=not torch.cuda.is_available() or args.no_cuda,
+        device=args.cuda if torch.cuda.is_available() and not args.no_cuda else -1,
     )
 
     def compute_metrics(eval_pred):
@@ -564,7 +570,6 @@ def main(args):
             "auc": float(auc)
         }
 
-    # Create our custom trainer with EarlyStoppingCallback.
     # Create our custom trainer with EarlyStoppingCallback.
     trainer = CustomTrainer(
         model=model,
@@ -631,6 +636,8 @@ if __name__ == "__main__":
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
     parser.add_argument("--cuda", type=int, default=0,
                         help="GPU device index to use (default: 0)")
+    parser.add_argument("--no_cuda", action="store_true",
+                        help="Do not use CUDA even if available")
 
     args = parser.parse_args()
     main(args)
