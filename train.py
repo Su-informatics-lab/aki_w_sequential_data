@@ -414,7 +414,7 @@ def main(args):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        learning_rate=1e-5,
+        learning_rate=args.learning_rate,
         save_steps=args.save_steps,
         save_total_limit=2,
         load_best_model_at_end=True,
@@ -502,6 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./patchtst_checkpoints")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
 
     # Hardware & debug options
     parser.add_argument("--cuda", type=int, default=0,
