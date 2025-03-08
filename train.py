@@ -160,7 +160,7 @@ class AKITrainer(Trainer):
             eval_dataset,
             batch_size=self.args.per_device_eval_batch_size,
             collate_fn=self.data_collator,
-            num_workers=self.args.num_workers,
+            # num_workers=self.args.num_workers,
             shuffle=True  # Enable shuffling for evaluation
         )
 
