@@ -303,9 +303,17 @@ class CustomTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.class_weights = None
 
+    # In the argument parser section, add this:
+    parser.add_argument("--cuda", type=int, default=0,
+                        help="GPU device index to use (default: 0)")
+
+    # In the CustomTrainer class, modify the compute_loss method:
     def compute_loss(self, model, inputs, return_outputs=False,
                      num_items_in_batch=None):
         print("[DEBUG] Batch keys before loss computation:", list(inputs.keys()))
+
+        # Get the model's device
+        model_device = next(model.parameters()).device
 
         # Even if labels is missing, we can derive it
         if "labels" not in inputs:
@@ -314,23 +322,29 @@ class CustomTrainer(Trainer):
             # Try to get from static_categorical_values
             if "static_categorical_values" in inputs:
                 print("[DEBUG] Using static_categorical_values as labels")
-                inputs["labels"] = inputs["static_categorical_values"].long()
+                inputs["labels"] = inputs["static_categorical_values"].long().to(
+                    model_device)
             # Or create dummy labels as last resort
             else:
                 batch_size = inputs["past_values"].size(0)
                 print(
                     f"[WARNING] Creating dummy labels tensor of shape ({batch_size},)")
-                inputs["labels"] = torch.zeros(batch_size, dtype=torch.long)
+                # Create the tensor on the same device as the model
+                inputs["labels"] = torch.zeros(batch_size, dtype=torch.long,
+                                               device=model_device)
 
         if "labels" not in inputs:
             raise KeyError("'labels' not found in inputs and could not be recovered.")
 
-        labels = inputs.pop("labels").long()
+        # Make sure labels are on the right device
+        labels = inputs.pop("labels").long().to(model_device)
         outputs = model(**inputs)
 
         if self.class_weights is not None:
+            # Make sure class weights are on the right device
+            class_weights = self.class_weights.to(model_device)
             loss = F.cross_entropy(outputs.prediction_logits, labels,
-                                   weight=self.class_weights.to(labels.device))
+                                   weight=class_weights)
         else:
             loss = F.cross_entropy(outputs.prediction_logits, labels)
 
@@ -615,6 +629,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
+    parser.add_argument("--cuda", type=int, default=0,
+                        help="GPU device index to use (default: 0)")
 
     args = parser.parse_args()
     main(args)
