@@ -439,13 +439,10 @@ def main(args):
 
     # Create and move model to device
     model = PatchTSTForClassification(config).to(device)
-
-    # In your main function, modify the TrainingArguments to use 'epoch' instead of 'steps'
     # for evaluation strategy
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="epoch",  # Changed from "steps" to "epoch"
-        eval_steps=None,  # Remove this when using epoch-based evaluation
         logging_steps=args.logging_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=max(args.batch_size * 4, 128),
@@ -454,8 +451,7 @@ def main(args):
         save_strategy="epoch",  # Changed from steps-based saving to epoch-based
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
+        metric_for_best_model="val_loss",
         report_to=["wandb"],
         no_cuda=not torch.cuda.is_available() or args.no_cuda,
         label_names=["target_values"],
