@@ -126,51 +126,64 @@ class AKITrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.class_weights = None
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    # In the AKITrainer class, update the compute_loss method:
+    def compute_loss(self, model, inputs, return_outputs=False,
+                     num_items_in_batch=None):
         model_device = next(model.parameters()).device
 
-        # Handle missing labels
-        if "labels" not in inputs:
-            if "static_categorical_values" in inputs:
-                inputs["labels"] = inputs["static_categorical_values"].long().to(model_device)
-            else:
-                batch_size = inputs["past_values"].size(0)
-                inputs["labels"] = torch.zeros(batch_size, dtype=torch.long, device=model_device)
+        # Handle labels through target_values which is expected by the model
+        if "target_values" not in inputs and "labels" in inputs:
+            inputs["target_values"] = inputs.pop("labels").to(model_device)
+        elif "target_values" not in inputs and "static_categorical_values" in inputs:
+            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                model_device)
+        elif "target_values" not in inputs:
+            batch_size = inputs["past_values"].size(0)
+            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                  device=model_device)
 
-        # Ensure labels are on the correct device
-        labels = inputs.pop("labels").long().to(model_device)
         outputs = model(**inputs)
+
+        # Extract the target_values for loss calculation
+        target_values = inputs["target_values"].long()
 
         # Apply class weights if available
         if self.class_weights is not None:
             class_weights = self.class_weights.to(model_device)
-            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=class_weights)
+            loss = F.cross_entropy(outputs.prediction_logits, target_values,
+                                   weight=class_weights)
         else:
-            loss = F.cross_entropy(outputs.prediction_logits, labels)
+            loss = F.cross_entropy(outputs.prediction_logits, target_values)
 
         return (loss, outputs) if return_outputs else loss
 
+    # Similarly, update prediction_step to use target_values:
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         model_device = next(model.parameters()).device
 
-        # Handle missing labels
-        if "labels" not in inputs:
-            if "static_categorical_values" in inputs:
-                inputs["labels"] = inputs["static_categorical_values"].long().to(model_device)
-            else:
-                batch_size = inputs["past_values"].size(0)
-                inputs["labels"] = torch.zeros(batch_size, dtype=torch.long, device=model_device)
+        # Handle labels through target_values
+        if "target_values" not in inputs and "labels" in inputs:
+            inputs["target_values"] = inputs.pop("labels").to(model_device)
+        elif "target_values" not in inputs and "static_categorical_values" in inputs:
+            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                model_device)
+        elif "target_values" not in inputs:
+            batch_size = inputs["past_values"].size(0)
+            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                  device=model_device)
 
         with torch.no_grad():
-            labels = inputs.pop("labels").long().to(model_device)
+            target_values = inputs["target_values"].long()
             outputs = model(**inputs)
 
             # Use class weights for evaluation if available
-            class_weights = self.class_weights.to(model_device) if self.class_weights is not None else None
-            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=class_weights)
+            class_weights = self.class_weights.to(
+                model_device) if self.class_weights is not None else None
+            loss = F.cross_entropy(outputs.prediction_logits, target_values,
+                                   weight=class_weights)
 
-            return (loss, outputs.prediction_logits, labels)
+            return (loss, outputs.prediction_logits, target_values)
 
 def compute_classification_metrics(eval_pred):
     """Calculate classification metrics from model predictions."""
@@ -365,7 +378,7 @@ def main(args):
         greater_is_better=True,      # Higher F1 is better
         report_to=["wandb"],
         no_cuda=not torch.cuda.is_available() or args.no_cuda,
-        label_names=["static_categorical_values"],  # Tell trainer where labels are
+        label_names=["target_values"],
     )
 
     # Create custom trainer
