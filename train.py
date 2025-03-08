@@ -40,7 +40,7 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only the observable signals (26 channels) are used as input)   |
+|  (Only observable signals (26 channels) are used as input)       |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
@@ -174,7 +174,7 @@ class OnTheFlyForecastDFDataset(Dataset):
     def __getitem__(self, idx):
         csv_path = self.file_list[idx]
         fname = os.path.basename(csv_path)
-        # Infer patient ID from the file name (e.g., "R94657_combined.csv" -> "R94657")
+        # Infer patient ID from file name (e.g., "R94657_combined.csv" -> "R94657")
         patient_id = fname.split('_')[0].strip()
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
@@ -210,7 +210,7 @@ class ClassificationDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Try to obtain patient ID from "id" then "ID"
+        # Try to get patient ID from "id" then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
@@ -227,20 +227,20 @@ class ClassificationDataset(Dataset):
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
         if self.debug and idx == 0:
             print(f"[DEBUG] ClassificationDataset example keys: {list(example.keys())}")
-            if "past_values" in example:
-                print(f"[DEBUG] past_values shape: {example['past_values'].shape}")
-            print(f"[DEBUG] labels: {example['labels']}")
+            print(f"[DEBUG] Patient ID: {patient_id}, Label: {example['labels']}")
         return example
 
 # --- Custom Data Collator ---
 def custom_data_collator(features):
     """
-    Custom collate function to ensure that the "labels" key is preserved.
+    Custom collate function to preserve all keys including 'labels'.
     """
+    # Debug: print keys from each feature
+    for i, f in enumerate(features):
+        print(f"[DEBUG] Feature {i} keys: {list(f.keys())}")
     batch = {}
     for key in features[0].keys():
         if key == "labels":
-            # Collate labels as a tensor.
             batch[key] = torch.tensor([f[key] for f in features], dtype=torch.long)
         else:
             try:
@@ -248,6 +248,7 @@ def custom_data_collator(features):
             except Exception as e:
                 print(f"[DEBUG] Could not stack key '{key}': {e}")
                 batch[key] = [f[key] for f in features]
+    print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
 
 # --- Custom Trainer Subclass ---
@@ -258,7 +259,6 @@ class CustomTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         print("[DEBUG] Batch keys before loss computation:", list(inputs.keys()))
-        # Use the provided labels from ClassificationDataset.
         labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
@@ -323,7 +323,7 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # Ensure an "id" column exists (copy from "ID").
+    # Ensure an "id" column exists for downstream processing.
     all_patients_df["id"] = all_patients_df["ID"]
 
     # Filter out rows whose "ID" is not in the label mapping.
@@ -379,20 +379,7 @@ def main(args):
             print("[DEBUG] past_values shape:", sample["past_values"].shape)
         print("[DEBUG] labels:", sample["labels"])
 
-    # Create DataLoaders using a custom collator to preserve all keys.
-    def custom_data_collator(features):
-        batch = {}
-        for key in features[0].keys():
-            if key == "labels":
-                batch[key] = torch.tensor([f[key] for f in features], dtype=torch.long)
-            else:
-                try:
-                    batch[key] = torch.stack([f[key] for f in features])
-                except Exception as e:
-                    print(f"[DEBUG] Could not stack key '{key}': {e}")
-                    batch[key] = [f[key] for f in features]
-        return batch
-
+    # Create DataLoaders using the custom data collator.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=custom_data_collator)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=custom_data_collator)
 
