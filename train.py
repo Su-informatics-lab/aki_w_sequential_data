@@ -38,7 +38,9 @@ from transformers import (
 from transformers.configuration_utils import PretrainedConfig
 from transformers import TrainerCallback
 
-# Add near the top of your script
+# Import the default collator to help build a custom one
+from transformers.data.data_collator import default_data_collator
+
 import warnings
 import re
 
@@ -46,6 +48,20 @@ import re
 warnings.filterwarnings("ignore",
                        message=re.escape("Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector."))
 
+def custom_data_collator(features):
+    """
+    Custom data collator that removes string fields (e.g., "id") from each sample,
+    as they cause issues when converting to tensors.
+    """
+    filtered_features = []
+    for f in features:
+        # Create a copy and remove keys that are not needed for training
+        filtered = dict(f)
+        if "id" in filtered:
+            filtered.pop("id")
+        # Optionally remove other problematic fields if necessary
+        filtered_features.append(filtered)
+    return default_data_collator(filtered_features)
 
 class FullEvalCallback(TrainerCallback):
     """Callback that runs full evaluation at specified steps."""
@@ -88,7 +104,6 @@ def pool_minute(df, pool_window=60):
         window = df.iloc[start:end]
         pooled_row = {}
         pooled_row["ID"] = window.iloc[0]["ID"]
-        # Use the label from the first row (which should be correct as injected earlier)
         pooled_row["Acute_kidney_injury"] = window.iloc[0]["Acute_kidney_injury"]
         pooled_row["time_idx"] = window["time_idx"].mean()
 
@@ -132,7 +147,7 @@ class OnTheFlyForecastDFDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
-        # Set AKI label using label_dict (injects static label from Excel)
+        # Set AKI label using label_dict
         df["Acute_kidney_injury"] = int(self.label_dict.get(patient_id, np.nan))
 
         if self.process_mode == "truncate":
@@ -160,7 +175,7 @@ class AKITrainer(Trainer):
             eval_dataset,
             batch_size=self.args.per_device_eval_batch_size,
             collate_fn=self.data_collator,
-            # num_workers=self.args.num_workers,
+            num_workers=self.args.num_workers,
             shuffle=True  # Enable shuffling for evaluation
         )
 
@@ -435,6 +450,7 @@ def main(args):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        data_collator=custom_data_collator,
         compute_metrics=compute_classification_metrics,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=10),
