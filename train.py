@@ -525,6 +525,7 @@ def main(args):
         }
 
     # Create our custom trainer with EarlyStoppingCallback.
+    # Create our custom trainer with EarlyStoppingCallback.
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -532,8 +533,13 @@ def main(args):
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
-        data_collator=custom_data_collator,
+        data_collator=custom_data_collator,  # Ensure this is being used
     )
+
+    # Add debugging to check if our collator is actually being used
+    print("Trainer data_collator:",
+          trainer.data_collator.__name__ if hasattr(trainer.data_collator,
+                                                    "__name__") else "Custom")
     trainer.class_weights = class_weights
     print("Using class weights:", class_weights)
 
