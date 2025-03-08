@@ -195,75 +195,124 @@ def collate_patient_batches(batch):
     return pd.concat(batch, ignore_index=True)
 
 # --- Custom Dataset Wrapper for Classification ---
+# --- Custom Dataset Wrapper for Classification ---
 class ClassificationDataset(Dataset):
     """
     A wrapper around ForecastDFDataset for classification.
     It adds a static label "labels" to each example based on the patient ID.
     """
+
     def __init__(self, base_dataset, label_mapping, debug=False):
         self.base_dataset = base_dataset
         self.label_mapping = {str(k).strip(): v for k, v in label_mapping.items()}
         self.debug = debug
 
+        # Print debug info once at initialization
+        if debug:
+            print("[DEBUG] Label mapping sample:", list(self.label_mapping.items())[:5])
+
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        # Convert the output of the base dataset to a mutable dictionary.
-        example = dict(self.base_dataset[idx])
+        # Get the base dataset item
+        base_item = self.base_dataset[idx]
+
+        # Create a new dictionary rather than modifying the original
+        # This is critical as modifying in-place might lead to unexpected behavior
+        example = {}
+        for key, value in base_item.items():
+            example[key] = value
+
         # Try to obtain patient ID from "id" then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
         elif "ID" in example:
             patient_id = example["ID"]
+
         if patient_id is None:
+            if self.debug:
+                print(
+                    f"[DEBUG] No patient ID found in example at index {idx}. Keys: {list(example.keys())}")
             raise KeyError("No patient ID found in example.")
+
         if isinstance(patient_id, (tuple, list)):
             patient_id = str(patient_id[0]).strip()
         else:
             patient_id = str(patient_id).strip()
+
         if patient_id not in self.label_mapping:
+            if self.debug:
+                print(f"[DEBUG] Patient ID {patient_id} not found in label mapping.")
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
-        example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
-        if self.debug and idx == 0:
-            print(f"[DEBUG] ClassificationDataset example keys: {list(example.keys())}")
-            print(f"[DEBUG] Patient ID: {patient_id}, Label: {example['labels']}")
+
+        # Add the label as a tensor
+        example["labels"] = torch.tensor(self.label_mapping[patient_id],
+                                         dtype=torch.long)
+
+        # Print detailed debug information
+        if self.debug and idx < 5:  # Only print for the first few examples
+            print(f"[DEBUG] Example {idx}:")
+            print(f"  Patient ID: {patient_id}")
+            print(f"  Label: {example['labels']}")
+            print(f"  Keys: {list(example.keys())}")
+
         return example
 
 
+# --- Custom Data Collator ---
 # --- Custom Data Collator ---
 def custom_data_collator(features):
     """
     Custom collate function to preserve all keys including 'labels'.
     """
-    # Directly extract and stack labels first
-    if all('labels' in f for f in features):
-        batch = {
-            'labels': torch.tensor([f['labels'] for f in features], dtype=torch.long)}
-    else:
-        print("WARNING: Not all samples have 'labels' key")
-        batch = {}
+    # First, check if we have labels
+    has_labels = all("labels" in f for f in features)
 
-    # Process other keys
+    if not has_labels:
+        print("WARNING: Not all samples have 'labels' key")
+        # Debug what keys are available
+        for i, f in enumerate(features[:3]):  # First 3 samples
+            print(f"[DEBUG] Sample {i} keys: {list(f.keys())}")
+
+    # Initialize the batch dictionary
+    batch = {}
+
+    # Process all keys, including 'labels'
     all_keys = set()
     for f in features:
         all_keys.update(f.keys())
 
     for key in all_keys:
-        if key == 'labels':
-            continue  # Already handled above
-
-        # Try to stack if possible
-        try:
-            values = [f.get(key) for f in features if key in f]
-            if all(v is not None and isinstance(v, torch.Tensor) for v in values):
-                batch[key] = torch.stack(values)
+        # Get values for this key
+        values = []
+        for f in features:
+            if key in f:
+                values.append(f[key])
             else:
+                # Use a placeholder for missing keys
+                print(f"[DEBUG] Key '{key}' missing from a sample")
+                # For 'labels', we can't proceed without it
+                if key == 'labels':
+                    print(f"[DEBUG] Critical key 'labels' missing from a sample!")
+                    break
+
+        # Only process if we have values
+        if values:
+            # Handle different types of data
+            if key == 'labels':
+                batch[key] = torch.tensor(values, dtype=torch.long)
+            elif all(isinstance(v, torch.Tensor) for v in values):
+                try:
+                    batch[key] = torch.stack(values)
+                except Exception as e:
+                    print(f"[DEBUG] Could not stack tensors for key '{key}': {e}")
+                    # Just keep as list if we can't stack
+                    batch[key] = values
+            else:
+                # Non-tensor data
                 batch[key] = values
-        except Exception as e:
-            print(f"[DEBUG] Could not stack key '{key}': {e}")
-            batch[key] = [f.get(key) for f in features if key in f]
 
     print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
