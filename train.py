@@ -602,8 +602,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cuda", type=int, default=0,
-                        help="GPU device index to use (default: 0)")
     parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
                         help="Folder with per-patient CSV files.")
     parser.add_argument("--preprocessed_path", type=str, default="preprocessed_data.parquet",
