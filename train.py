@@ -10,6 +10,9 @@ The process:
 2. Combine into a single dataset with proper time indexing
 3. Create ForecastDFDataset with static AKI labels
 4. Train a PatchTSTForClassification model to predict binary AKI status
+
+Usage:
+python train.py --data_dir "time_series_data_LSTM_10_29_2024" --process_mode "pool" --pool_window 60 --pool_method "average" --batch_size 32 --patch_length 16 --patch_stride 8 --d_model 64 --num_hidden_layers 2 --num_attention_heads 8 --output_dir "./patchtst_checkpoints" --eval_steps 100 --logging_steps 50 --save_steps 100 --epochs 50 --cuda=1  --learning_rate 1e-5 --debug
 """
 
 import os
