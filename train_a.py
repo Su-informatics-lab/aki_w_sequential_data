@@ -249,8 +249,8 @@ class AKITrainer(Trainer):
     def _filter_forecast_inputs(self, inputs):
         """Filter out forecast-related inputs that classification models don't use"""
         # Keep only inputs that PatchTSTForClassification expects
-        allowed_keys = ['past_values', 'past_observed_mask', 'static_categorical_values',
-                        'target_values', 'id', 'timestamp']
+        # Note: PatchTSTForClassification only accepts past_values, past_observed_mask, and target_values
+        allowed_keys = ['past_values', 'past_observed_mask', 'target_values']
         return {k: v for k, v in inputs.items() if k in allowed_keys}
 
     def compute_loss(self, model, inputs, return_outputs=False,
