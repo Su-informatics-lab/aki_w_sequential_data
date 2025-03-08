@@ -26,7 +26,7 @@ Overall Process:
 |     Filtered DataFrame with only valid patient IDs           |
 +--------------------------------------------------------------+
               |
-              | Ensure an "id" column exists for downstream processing.
+              | Ensure an "id" column exists (copy from "ID").
               v
 +--------------------------------------------------------------+
 |         DataFrame with "ID" copied to "id"                   |
@@ -40,7 +40,7 @@ Overall Process:
 |     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only observable signals (26 channels) are used as input)       |
+|  (Only the observable signals (26 channels) are used as input)   |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
@@ -53,7 +53,7 @@ Overall Process:
 |    - labels: scalar (AKI label from imputed_demo_data.xlsx)      |
 +--------------------------------------------------------------+
               |
-              | DataLoader batches examples
+              | DataLoader batches examples using a custom collator
               v
 +--------------------------------------------------------------+
 |            PatchTST Classification Model                     |
@@ -216,7 +216,7 @@ class ClassificationDataset(Dataset):
             patient_id = example["id"]
         elif "ID" in example:
             patient_id = example["ID"]
-        else:
+        if patient_id is None:
             raise KeyError("No patient ID found in example.")
         if isinstance(patient_id, (tuple, list)):
             patient_id = str(patient_id[0]).strip()
@@ -226,11 +226,29 @@ class ClassificationDataset(Dataset):
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
         example["labels"] = torch.tensor(self.label_mapping[patient_id], dtype=torch.long)
         if self.debug and idx == 0:
-            print(f"[DEBUG] Example keys: {list(example.keys())}")
+            print(f"[DEBUG] ClassificationDataset example keys: {list(example.keys())}")
             if "past_values" in example:
                 print(f"[DEBUG] past_values shape: {example['past_values'].shape}")
             print(f"[DEBUG] labels: {example['labels']}")
         return example
+
+# --- Custom Data Collator ---
+def custom_data_collator(features):
+    """
+    Custom collate function to ensure that the "labels" key is preserved.
+    """
+    batch = {}
+    for key in features[0].keys():
+        if key == "labels":
+            # Collate labels as a tensor.
+            batch[key] = torch.tensor([f[key] for f in features], dtype=torch.long)
+        else:
+            try:
+                batch[key] = torch.stack([f[key] for f in features])
+            except Exception as e:
+                print(f"[DEBUG] Could not stack key '{key}': {e}")
+                batch[key] = [f[key] for f in features]
+    return batch
 
 # --- Custom Trainer Subclass ---
 class CustomTrainer(Trainer):
@@ -305,10 +323,10 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # Ensure an "id" column exists for downstream processing.
+    # Ensure an "id" column exists (copy from "ID").
     all_patients_df["id"] = all_patients_df["ID"]
 
-    # Filter out rows with IDs not in the label mapping.
+    # Filter out rows whose "ID" is not in the label mapping.
     all_patients_df = all_patients_df[all_patients_df["ID"].isin(label_dict.keys())]
 
     # Split data by patient ID.
@@ -361,9 +379,22 @@ def main(args):
             print("[DEBUG] past_values shape:", sample["past_values"].shape)
         print("[DEBUG] labels:", sample["labels"])
 
-    # Create DataLoaders.
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Create DataLoaders using a custom collator to preserve all keys.
+    def custom_data_collator(features):
+        batch = {}
+        for key in features[0].keys():
+            if key == "labels":
+                batch[key] = torch.tensor([f[key] for f in features], dtype=torch.long)
+            else:
+                try:
+                    batch[key] = torch.stack([f[key] for f in features])
+                except Exception as e:
+                    print(f"[DEBUG] Could not stack key '{key}': {e}")
+                    batch[key] = [f[key] for f in features]
+        return batch
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=custom_data_collator)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=custom_data_collator)
 
     # Compute class weights from training labels.
     labels_train = train_df["Acute_kidney_injury"].values
@@ -441,7 +472,8 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        data_collator=custom_data_collator,
     )
     trainer.class_weights = class_weights
     print("Using class weights:", class_weights)
