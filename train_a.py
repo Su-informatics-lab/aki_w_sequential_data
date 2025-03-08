@@ -246,25 +246,35 @@ class AKITrainer(Trainer):
         else:
             return super().get_eval_dataloader(eval_dataset)
 
+    def _filter_forecast_inputs(self, inputs):
+        """Filter out forecast-related inputs that classification models don't use"""
+        # Keep only inputs that PatchTSTForClassification expects
+        allowed_keys = ['past_values', 'past_observed_mask', 'static_categorical_values',
+                        'target_values', 'id', 'timestamp']
+        return {k: v for k, v in inputs.items() if k in allowed_keys}
+
     def compute_loss(self, model, inputs, return_outputs=False,
                      num_items_in_batch=None):
         model_device = next(model.parameters()).device
 
-        # Handle labels through target_values which is expected by the model
-        if "target_values" not in inputs and "labels" in inputs:
-            inputs["target_values"] = inputs.pop("labels").to(model_device)
-        elif "target_values" not in inputs and "static_categorical_values" in inputs:
-            inputs["target_values"] = inputs["static_categorical_values"].long().to(
-                model_device)
-        elif "target_values" not in inputs:
-            batch_size = inputs["past_values"].size(0)
-            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
-                                                  device=model_device)
+        # Filter out unexpected inputs
+        filtered_inputs = self._filter_forecast_inputs(inputs)
 
-        outputs = model(**inputs)
+        # Handle labels through target_values which is expected by the model
+        if "target_values" not in filtered_inputs and "labels" in filtered_inputs:
+            filtered_inputs["target_values"] = filtered_inputs.pop("labels").to(model_device)
+        elif "target_values" not in filtered_inputs and "static_categorical_values" in filtered_inputs:
+            filtered_inputs["target_values"] = filtered_inputs["static_categorical_values"].long().to(
+                model_device)
+        elif "target_values" not in filtered_inputs:
+            batch_size = filtered_inputs["past_values"].size(0)
+            filtered_inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                           device=model_device)
+
+        outputs = model(**filtered_inputs)
 
         # Extract the target_values for loss calculation
-        target_values = inputs["target_values"].long()
+        target_values = filtered_inputs["target_values"].long()
 
         # Apply class weights if available
         if self.class_weights is not None:
@@ -280,27 +290,30 @@ class AKITrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
         model_device = next(model.parameters()).device
 
+        # Filter out unexpected inputs
+        filtered_inputs = self._filter_forecast_inputs(inputs)
+
         # Handle labels through target_values
-        if "target_values" not in inputs and "labels" in inputs:
-            inputs["target_values"] = inputs.pop("labels").to(model_device)
-        elif "target_values" not in inputs and "static_categorical_values" in inputs:
-            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+        if "target_values" not in filtered_inputs and "labels" in filtered_inputs:
+            filtered_inputs["target_values"] = filtered_inputs.pop("labels").to(model_device)
+        elif "target_values" not in filtered_inputs and "static_categorical_values" in filtered_inputs:
+            filtered_inputs["target_values"] = filtered_inputs["static_categorical_values"].long().to(
                 model_device)
-        elif "target_values" not in inputs:
-            batch_size = inputs["past_values"].size(0)
-            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
-                                                  device=model_device)
+        elif "target_values" not in filtered_inputs:
+            batch_size = filtered_inputs["past_values"].size(0)
+            filtered_inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                           device=model_device)
 
         # Debug logging: print unique target values for evaluation batches
         self.eval_batch_count += 1
         if self.eval_batch_count <= 5:  # print for the first 5 batches
-            unique_vals = torch.unique(inputs["target_values"])
+            unique_vals = torch.unique(filtered_inputs["target_values"])
             print(
                 f"[DEBUG] Evaluation Batch {self.eval_batch_count} target_values unique: {unique_vals.cpu().numpy()}")
 
         with torch.no_grad():
-            target_values = inputs["target_values"].long()
-            outputs = model(**inputs)
+            target_values = filtered_inputs["target_values"].long()
+            outputs = model(**filtered_inputs)
 
             # Use class weights for evaluation if available
             class_weights = self.class_weights.to(
