@@ -524,7 +524,7 @@ def main(args):
     config = PatchTSTConfig(**config_dict)
     model = PatchTSTForClassification(config).to(device)
 
-    # Create training arguments with a lower learning rate.
+    # create training arguments with a lower learning rate.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
@@ -539,9 +539,7 @@ def main(args):
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         report_to=["wandb"],
-        # Add this to specify which device to use
         no_cuda=not torch.cuda.is_available() or args.no_cuda,
-        device=args.cuda if torch.cuda.is_available() and not args.no_cuda else -1,
     )
 
     def compute_metrics(eval_pred):
