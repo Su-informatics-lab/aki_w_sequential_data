@@ -204,30 +204,41 @@ class AKITrainer(Trainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
+        # Remove keys that the model does not expect.
+        for key in ["future_values", "future_observed_mask", "timestamp", "id"]:
+            if key in inputs:
+                inputs.pop(key)
+
         model_device = next(model.parameters()).device
 
         if "target_values" not in inputs and "labels" in inputs:
             inputs["target_values"] = inputs.pop("labels").to(model_device)
         elif "target_values" not in inputs and "static_categorical_values" in inputs:
-            inputs["target_values"] = inputs["static_categorical_values"].long().to(model_device)
+            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                model_device)
         elif "target_values" not in inputs:
             batch_size = inputs["past_values"].size(0)
-            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long, device=model_device)
+            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                  device=model_device)
 
-        # Debug logging: print unique target values for the first few evaluation batches
+        # Debug logging: print unique target values for the first few evaluation batches.
         if not hasattr(self, "eval_batch_count"):
             self.eval_batch_count = 0
         self.eval_batch_count += 1
         if self.eval_batch_count <= 3:
             unique_vals = torch.unique(inputs["target_values"])
-            print(f"[DEBUG] Evaluation Batch {self.eval_batch_count} target_values unique: {unique_vals.cpu().numpy()}")
+            print(
+                f"[DEBUG] Evaluation Batch {self.eval_batch_count} target_values unique: {unique_vals.cpu().numpy()}")
 
         with torch.no_grad():
             target_values = inputs["target_values"].long()
             outputs = model(**inputs)
-            class_weights = self.class_weights.to(model_device) if self.class_weights is not None else None
-            loss = F.cross_entropy(outputs.prediction_logits, target_values, weight=class_weights)
+            class_weights = self.class_weights.to(
+                model_device) if self.class_weights is not None else None
+            loss = F.cross_entropy(outputs.prediction_logits, target_values,
+                                   weight=class_weights)
             return (loss, outputs.prediction_logits, target_values)
+
 
 def compute_classification_metrics(eval_pred):
     """Calculate classification metrics from model predictions with better edge case handling."""
