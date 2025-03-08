@@ -275,7 +275,7 @@ def main(args):
     # Load AKI labels from Excel file
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
-    label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
+    label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
     if args.debug:
         print(f'{label_dict=}')
 
