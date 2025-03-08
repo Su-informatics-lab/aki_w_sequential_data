@@ -26,10 +26,10 @@ Overall Process:
 |     Filtered DataFrame with only valid patient IDs           |
 +--------------------------------------------------------------+
               |
-              | (Ensure an "id" column is present for downstream processing)
+              | Ensure an "id" column exists for downstream processing.
               v
 +--------------------------------------------------------------+
-|           DataFrame with added "id" column                   |
+|         DataFrame with "ID" copied to "id"                   |
 +--------------------------------------------------------------+
               |
               | Split by unique patient IDs into train and validation sets
@@ -37,14 +37,14 @@ Overall Process:
 +--------------------------------------------------------------+
 |   ForecastDFDataset (from tsfm_public.toolkit.dataset)         |
 |  Configured with:                                              |
-|     id_columns = ["ID"] (or "id")                               |
+|     id_columns = ["ID"]                                         |
 |     timestamp_column = "time_idx"                               |
 |     target_columns = observable_columns = [F1, F2, ..., F26]    |
-|  (Only the observable signals (26 channels) are used as input)   |
+|  (Only observable signals (26 channels) are used as input)       |
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
-              | by matching the patient ID (from "id") to the label mapping.
+              | by matching the patient ID (from "id" or "ID") to the label mapping.
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
@@ -210,13 +210,13 @@ class ClassificationDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.base_dataset[idx]
-        # Try to obtain patient ID from "id" key; if not, use "ID".
+        # Try to obtain patient ID from "id" then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
         elif "ID" in example:
             patient_id = example["ID"]
-        if patient_id is None:
+        else:
             raise KeyError("No patient ID found in example.")
         if isinstance(patient_id, (tuple, list)):
             patient_id = str(patient_id[0]).strip()
@@ -239,6 +239,8 @@ class CustomTrainer(Trainer):
         self.class_weights = None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        print("[DEBUG] Batch keys before loss computation:", list(inputs.keys()))
+        # Use the provided labels from ClassificationDataset.
         labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
@@ -303,10 +305,10 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # Ensure an "id" column exists (copy from "ID").
+    # Ensure an "id" column exists for downstream processing.
     all_patients_df["id"] = all_patients_df["ID"]
 
-    # Filter out any rows whose "ID" is not in the label mapping.
+    # Filter out rows with IDs not in the label mapping.
     all_patients_df = all_patients_df[all_patients_df["ID"].isin(label_dict.keys())]
 
     # Split data by patient ID.
