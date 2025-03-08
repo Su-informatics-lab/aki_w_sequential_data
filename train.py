@@ -185,21 +185,46 @@ class AKITrainer(Trainer):
 
             return (loss, outputs.prediction_logits, target_values)
 
+
 def compute_classification_metrics(eval_pred):
-    """Calculate classification metrics from model predictions."""
+    """Calculate classification metrics from model predictions with better edge case handling."""
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
 
-    accuracy = accuracy_score(labels, preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, preds, average='binary', zero_division=0
-    )
+    # Check if we have only one class in the evaluation set
+    unique_labels = np.unique(labels)
+    if len(unique_labels) == 1:
+        print(f"Warning: Only one class ({unique_labels[0]}) present in evaluation set")
+        # For single-class evaluation, metrics need special handling
+        accuracy = accuracy_score(labels, preds)
 
-    try:
-        # For binary classification
-        auc = roc_auc_score(labels, preds)
-    except Exception:
-        auc = 0.0
+        # If all predictions match the single class (perfect prediction)
+        if np.array_equal(preds, labels):
+            precision, recall, f1 = 1.0, 1.0, 1.0
+        else:
+            # Some predictions are wrong - minority class is missing in true labels
+            # but predicted, or vice versa
+            precision = 0.0 if unique_labels[0] == 0 else 0.0
+            recall = 0.0
+            f1 = 0.0
+
+        # AUC is undefined for single-class, but we set to 0.5 (random chance)
+        auc = 0.5
+    else:
+        # Normal case with multiple classes
+        accuracy = accuracy_score(labels, preds)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, preds, average='binary', zero_division=0
+        )
+
+        try:
+            # For ROC AUC, we need the probability scores instead of class predictions
+            # We get the probability of the positive class (class 1)
+            proba_pos = softmax(logits, axis=1)[:, 1]
+            auc = roc_auc_score(labels, proba_pos)
+        except Exception as e:
+            print(f"Warning: Could not compute AUC: {e}")
+            auc = 0.5  # Default to random chance
 
     return {
         "accuracy": float(accuracy),
@@ -208,6 +233,11 @@ def compute_classification_metrics(eval_pred):
         "f1": float(f1),
         "auc": float(auc)
     }
+
+def softmax(x, axis=None):
+    """Compute softmax values for each set of scores in x."""
+    e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return e_x / e_x.sum(axis=axis, keepdims=True)
 
 def main(args):
     """Main training function."""
@@ -268,9 +298,23 @@ def main(args):
 
     # Split data by patient ID
     unique_ids = all_patients_df["ID"].unique()
-    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
+    # In your main function, replace the train/val split with:
+    train_ids, val_ids = train_test_split(
+        unique_ids,
+        test_size=0.2,
+        random_state=42,
+        stratify=[label_dict[str(patient_id).strip()] for patient_id in unique_ids if
+                  str(patient_id).strip() in label_dict]
+    )
+
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
+
+    # Add after you create train_df and val_df:
+    print("Training label distribution:",
+          train_df["Acute_kidney_injury"].value_counts().to_dict())
+    print("Validation label distribution:",
+          val_df["Acute_kidney_injury"].value_counts().to_dict())
 
     # Determine feature columns
     feature_cols = [col for col in all_patients_df.columns
