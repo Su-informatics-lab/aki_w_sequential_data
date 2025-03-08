@@ -36,6 +36,29 @@ from transformers import (
     EarlyStoppingCallback,
 )
 from transformers.configuration_utils import PretrainedConfig
+from transformers import TrainerCallback
+
+# Add near the top of your script
+import warnings
+import re
+
+# Filter only the specific warning about gathering along dimension 0
+warnings.filterwarnings("ignore",
+                       message=re.escape("Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector."))
+
+
+class FullEvalCallback(TrainerCallback):
+    """Callback that runs full evaluation at specified steps."""
+
+    def __init__(self, eval_steps):
+        self.eval_steps = eval_steps
+        self.last_eval_step = 0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if (state.global_step - self.last_eval_step) >= self.eval_steps:
+            control.should_evaluate = True
+            self.last_eval_step = state.global_step
+        return control
 
 # Patch PretrainedConfig's to_dict for JSON serialization
 original_to_dict = PretrainedConfig.to_dict
@@ -405,21 +428,22 @@ def main(args):
     # Create and move model to device
     model = PatchTSTForClassification(config).to(device)
 
-    # Configure training arguments
+    # In your main function, modify the TrainingArguments to use 'epoch' instead of 'steps'
+    # for evaluation strategy
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
+        evaluation_strategy="epoch",  # Changed from "steps" to "epoch"
+        eval_steps=None,  # Remove this when using epoch-based evaluation
         logging_steps=args.logging_steps,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=max(args.batch_size * 4, 128),
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
-        save_steps=args.save_steps,
+        save_strategy="epoch",  # Changed from steps-based saving to epoch-based
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1",  # Use F1 instead of loss for imbalanced data
-        greater_is_better=True,      # Higher F1 is better
+        metric_for_best_model="f1",
+        greater_is_better=True,
         report_to=["wandb"],
         no_cuda=not torch.cuda.is_available() or args.no_cuda,
         label_names=["target_values"],
@@ -432,7 +456,10 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_classification_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
+        callbacks=[
+            EarlyStoppingCallback(early_stopping_patience=10),
+            FullEvalCallback(eval_steps=args.eval_steps)
+        ],
     )
 
     # Set class weights for weighted loss
