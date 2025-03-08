@@ -321,14 +321,26 @@ def main(args):
 
     # Split data by patient ID
     unique_ids = all_patients_df["ID"].unique()
-    # In your main function, replace the train/val split with:
+    # Simple random split without stratification
     train_ids, val_ids = train_test_split(
         unique_ids,
         test_size=0.2,
-        random_state=42,
-        stratify=[label_dict[str(patient_id).strip()] for patient_id in unique_ids if
-                  str(patient_id).strip() in label_dict]
+        random_state=42
     )
+
+    # Print the distribution of labels in both sets for verification
+    train_label_counts = {0: 0, 1: 0}
+    for id in train_ids:
+        label = label_dict[str(id).strip()]
+        train_label_counts[label] += 1
+
+    val_label_counts = {0: 0, 1: 0}
+    for id in val_ids:
+        label = label_dict[str(id).strip()]
+        val_label_counts[label] += 1
+
+    print("Training set label distribution:", train_label_counts)
+    print("Validation set label distribution:", val_label_counts)
 
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
