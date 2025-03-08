@@ -231,26 +231,40 @@ class ClassificationDataset(Dataset):
             print(f"[DEBUG] Patient ID: {patient_id}, Label: {example['labels']}")
         return example
 
+
 # --- Custom Data Collator ---
 def custom_data_collator(features):
     """
     Custom collate function to preserve all keys including 'labels'.
     """
-    # Compute the union of all keys in the batch.
+    # Directly extract and stack labels first
+    if all('labels' in f for f in features):
+        batch = {
+            'labels': torch.tensor([f['labels'] for f in features], dtype=torch.long)}
+    else:
+        print("WARNING: Not all samples have 'labels' key")
+        batch = {}
+
+    # Process other keys
     all_keys = set()
     for f in features:
         all_keys.update(f.keys())
-    batch = {}
+
     for key in all_keys:
-        if key == "labels":
-            batch[key] = torch.tensor([f.get(key) for f in features], dtype=torch.long)
-        else:
-            # Try to stack if possible.
-            try:
-                batch[key] = torch.stack([f.get(key) for f in features])
-            except Exception as e:
-                print(f"[DEBUG] Could not stack key '{key}': {e}")
-                batch[key] = [f.get(key) for f in features]
+        if key == 'labels':
+            continue  # Already handled above
+
+        # Try to stack if possible
+        try:
+            values = [f.get(key) for f in features if key in f]
+            if all(v is not None and isinstance(v, torch.Tensor) for v in values):
+                batch[key] = torch.stack(values)
+            else:
+                batch[key] = values
+        except Exception as e:
+            print(f"[DEBUG] Could not stack key '{key}': {e}")
+            batch[key] = [f.get(key) for f in features if key in f]
+
     print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
 
@@ -260,12 +274,18 @@ class CustomTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.class_weights = None
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(self, model, inputs, return_outputs=False,
+                     num_items_in_batch=None):
         print("[DEBUG] Batch keys before loss computation:", list(inputs.keys()))
+        if "labels" not in inputs:
+            raise KeyError(
+                "'labels' not found in inputs. Check your data collator and dataset implementation.")
+
         labels = inputs.pop("labels").long()
         outputs = model(**inputs)
         if self.class_weights is not None:
-            loss = F.cross_entropy(outputs.prediction_logits, labels, weight=self.class_weights.to(labels.device))
+            loss = F.cross_entropy(outputs.prediction_logits, labels,
+                                   weight=self.class_weights.to(labels.device))
         else:
             loss = F.cross_entropy(outputs.prediction_logits, labels)
         return (loss, outputs) if return_outputs else loss
