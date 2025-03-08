@@ -276,6 +276,8 @@ def main(args):
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = {str(x).strip(): y for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
+    if args.debug:
+        print(f'{label_dict=}')
 
     # Filter file list to include only files with valid patient IDs
     file_list = [
@@ -324,11 +326,14 @@ def main(args):
 
     # Split data by patient ID
     unique_ids = all_patients_df["ID"].unique()
-    # Simple random split without stratification
+    labels = [label_dict[str(id).strip()] for id in
+              unique_ids]  # extract labels for each unique id
+
     train_ids, val_ids = train_test_split(
         unique_ids,
         test_size=0.2,
-        random_state=42
+        random_state=42,
+        stratify=labels  # Stratify based on labels
     )
 
     # Print the distribution of labels in both sets for verification
