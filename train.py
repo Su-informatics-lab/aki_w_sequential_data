@@ -19,7 +19,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -38,9 +38,7 @@ from transformers import (
 from transformers.configuration_utils import PretrainedConfig
 from transformers import TrainerCallback
 
-# Import the default collator to help build a custom one
-from transformers.data.data_collator import default_data_collator
-
+# Add near the top of your script
 import warnings
 import re
 
@@ -48,23 +46,10 @@ import re
 warnings.filterwarnings("ignore",
                        message=re.escape("Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector."))
 
-def custom_data_collator(features):
-    """
-    Custom data collator that removes string fields (e.g., "id") from each sample,
-    as they cause issues when converting to tensors.
-    """
-    filtered_features = []
-    for f in features:
-        # Create a copy and remove keys that are not needed for training
-        filtered = dict(f)
-        if "id" in filtered:
-            filtered.pop("id")
-        # Optionally remove other problematic fields if necessary
-        filtered_features.append(filtered)
-    return default_data_collator(filtered_features)
 
 class FullEvalCallback(TrainerCallback):
     """Callback that runs full evaluation at specified steps."""
+
     def __init__(self, eval_steps):
         self.eval_steps = eval_steps
         self.last_eval_step = 0
@@ -164,68 +149,58 @@ class AKITrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.class_weights = None
 
-    def get_eval_dataloader(self, eval_dataset=None):
-        """
-        Override the default evaluation dataloader to shuffle the evaluation data,
-        ensuring that each batch is more representative of the overall class distribution.
-        """
-        if eval_dataset is None:
-            eval_dataset = self.eval_dataset
-        return DataLoader(
-            eval_dataset,
-            batch_size=self.args.per_device_eval_batch_size,
-            collate_fn=self.data_collator,
-            # num_workers=self.args.num_workers,
-            shuffle=True  # Enable shuffling for evaluation
-        )
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    # In the AKITrainer class, update the compute_loss method:
+    def compute_loss(self, model, inputs, return_outputs=False,
+                     num_items_in_batch=None):
         model_device = next(model.parameters()).device
 
         # Handle labels through target_values which is expected by the model
         if "target_values" not in inputs and "labels" in inputs:
             inputs["target_values"] = inputs.pop("labels").to(model_device)
         elif "target_values" not in inputs and "static_categorical_values" in inputs:
-            inputs["target_values"] = inputs["static_categorical_values"].long().to(model_device)
+            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                model_device)
         elif "target_values" not in inputs:
             batch_size = inputs["past_values"].size(0)
-            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long, device=model_device)
+            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                  device=model_device)
 
         outputs = model(**inputs)
+
+        # Extract the target_values for loss calculation
         target_values = inputs["target_values"].long()
 
+        # Apply class weights if available
         if self.class_weights is not None:
             class_weights = self.class_weights.to(model_device)
-            loss = F.cross_entropy(outputs.prediction_logits, target_values, weight=class_weights)
+            loss = F.cross_entropy(outputs.prediction_logits, target_values,
+                                   weight=class_weights)
         else:
             loss = F.cross_entropy(outputs.prediction_logits, target_values)
 
         return (loss, outputs) if return_outputs else loss
 
+    # Similarly, update prediction_step to use target_values:
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         model_device = next(model.parameters()).device
 
-        # If target_values is not set, derive it from static_categorical_values if available.
-        if "target_values" not in inputs:
-            if "static_categorical_values" in inputs:
-                inputs["target_values"] = inputs["static_categorical_values"].long().to(
-                    model_device)
-            else:
-                batch_size = inputs["past_values"].size(0)
-                inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
-                                                      device=model_device)
+        # Handle labels through target_values
+        if "target_values" not in inputs and "labels" in inputs:
+            inputs["target_values"] = inputs.pop("labels").to(model_device)
+        elif "target_values" not in inputs and "static_categorical_values" in inputs:
+            inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                model_device)
+        elif "target_values" not in inputs:
+            batch_size = inputs["past_values"].size(0)
+            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                  device=model_device)
 
-        # Remove keys that the model does not expect.
-        for key in ["future_values", "future_observed_mask", "timestamp", "id",
-                    "static_categorical_values"]:
-            inputs.pop(key, None)
-
-        # Debug logging: print unique target values for the first few evaluation batches.
+        # Debug logging: print unique target values for the first few evaluation batches
         if not hasattr(self, "eval_batch_count"):
             self.eval_batch_count = 0
         self.eval_batch_count += 1
-        if self.eval_batch_count <= 3:
+        if self.eval_batch_count <= 3:  # only print for the first 3 batches
             unique_vals = torch.unique(inputs["target_values"])
             print(
                 f"[DEBUG] Evaluation Batch {self.eval_batch_count} target_values unique: {unique_vals.cpu().numpy()}")
@@ -233,10 +208,13 @@ class AKITrainer(Trainer):
         with torch.no_grad():
             target_values = inputs["target_values"].long()
             outputs = model(**inputs)
+
+            # Use class weights for evaluation if available
             class_weights = self.class_weights.to(
                 model_device) if self.class_weights is not None else None
             loss = F.cross_entropy(outputs.prediction_logits, target_values,
                                    weight=class_weights)
+
             return (loss, outputs.prediction_logits, target_values)
 
 
@@ -245,27 +223,33 @@ def compute_classification_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
 
-    # Debug logging: print unique labels present in the aggregated evaluation set
+    # Debug logging: print the unique labels present in the evaluation set
     unique_labels = np.unique(labels)
     print(f"[DEBUG] In compute_classification_metrics, unique labels: {unique_labels}")
 
     if len(unique_labels) == 1:
         print(f"Warning: Only one class ({unique_labels[0]}) present in evaluation set")
+        # For single-class evaluation, metrics need special handling
         accuracy = accuracy_score(labels, preds)
         if np.array_equal(preds, labels):
             precision, recall, f1 = 1.0, 1.0, 1.0
         else:
-            precision, recall, f1 = 0.0, 0.0, 0.0
-        auc = 0.5  # AUC undefined for single-class, default to 0.5
+            precision = 0.0
+            recall = 0.0
+            f1 = 0.0
+        auc = 0.5  # AUC undefined for single-class, so default to 0.5 (random chance)
     else:
         accuracy = accuracy_score(labels, preds)
-        precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='binary', zero_division=0)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, preds, average='binary', zero_division=0
+        )
         try:
+            # Compute probability of the positive class (class 1)
             proba_pos = softmax(logits, axis=1)[:, 1]
             auc = roc_auc_score(labels, proba_pos)
         except Exception as e:
             print(f"Warning: Could not compute AUC: {e}")
-            auc = 0.5
+            auc = 0.5  # Default to random chance
 
     return {
         "accuracy": float(accuracy),
@@ -275,6 +259,7 @@ def compute_classification_metrics(eval_pred):
         "auc": float(auc)
     }
 
+
 def softmax(x, axis=None):
     """Compute softmax values for each set of scores in x."""
     e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
@@ -282,6 +267,7 @@ def softmax(x, axis=None):
 
 def main(args):
     """Main training function."""
+    # Initialize wandb and device
     wandb.init(project="patchtst_aki", config=vars(args))
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
@@ -306,6 +292,7 @@ def main(args):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
     else:
+        # Process patient files and save to parquet
         base_dataset = OnTheFlyForecastDFDataset(
             file_list=file_list,
             label_dict=label_dict,
@@ -337,9 +324,14 @@ def main(args):
 
     # Split data by patient ID
     unique_ids = all_patients_df["ID"].unique()
-    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
+    # Simple random split without stratification
+    train_ids, val_ids = train_test_split(
+        unique_ids,
+        test_size=0.2,
+        random_state=42
+    )
 
-    # Print distribution of labels in patient split
+    # Print the distribution of labels in both sets for verification
     train_label_counts = {0: 0, 1: 0}
     for id in train_ids:
         label = label_dict[str(id).strip()]
@@ -356,14 +348,18 @@ def main(args):
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
 
-    print("Training label distribution:", train_df["Acute_kidney_injury"].value_counts().to_dict())
-    print("Validation label distribution:", val_df["Acute_kidney_injury"].value_counts().to_dict())
+    # Add after you create train_df and val_df:
+    print("Training label distribution:",
+          train_df["Acute_kidney_injury"].value_counts().to_dict())
+    print("Validation label distribution:",
+          val_df["Acute_kidney_injury"].value_counts().to_dict())
 
-    # Determine feature columns (dynamic signals)
+    # Determine feature columns
     feature_cols = [col for col in all_patients_df.columns
                     if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                     and not col.startswith("Unnamed")
                     and np.issubdtype(all_patients_df[col].dtype, np.number)]
+
     print(f"Detected {len(feature_cols)} feature channels: {feature_cols}")
     num_input_channels = len(feature_cols)
 
@@ -403,6 +399,8 @@ def main(args):
             print(f"past_values shape: {sample['past_values'].shape}")
         if "static_categorical_values" in sample:
             print(f"static_categorical_values: {sample['static_categorical_values']}")
+
+        # Create a batch of one sample to check collation
         batch = {}
         for key in sample:
             if isinstance(sample[key], torch.Tensor):
@@ -415,10 +413,15 @@ def main(args):
     labels_train = train_df["Acute_kidney_injury"].values
     unique, counts = np.unique(labels_train, return_counts=True)
     print("Training label distribution:", dict(zip(unique, counts)))
+
+    # Inverse frequency weighting
     weight_list = []
     for i in range(2):  # Binary classification
         freq = counts[unique == i]
-        weight_list.append(1.0 / freq[0] if freq.size > 0 else 0.0)
+        if freq.size > 0:
+            weight_list.append(1.0 / freq[0])
+        else:
+            weight_list.append(0.0)
     class_weights = torch.tensor(weight_list, dtype=torch.float).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
 
@@ -439,15 +442,16 @@ def main(args):
 
     # Create and move model to device
     model = PatchTSTForClassification(config).to(device)
+    # for evaluation strategy
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="epoch",
+        evaluation_strategy="epoch",  # Changed from "steps" to "epoch"
         logging_steps=args.logging_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=max(args.batch_size * 4, 128),
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
-        save_strategy="epoch",
+        save_strategy="epoch",  # Changed from steps-based saving to epoch-based
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -456,12 +460,12 @@ def main(args):
         label_names=["target_values"],
     )
 
+    # Create custom trainer
     trainer = AKITrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=custom_data_collator,
         compute_metrics=compute_classification_metrics,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=10),
@@ -469,17 +473,21 @@ def main(args):
         ],
     )
 
+    # Set class weights for weighted loss
     trainer.class_weights = class_weights
     print("Using class weights:", class_weights)
 
+    # Disable saving if requested
     if args.no_save:
         print("Saving is disabled")
         training_args.save_steps = int(1e9)
         training_args.save_total_limit = 0
 
+    # Train model
     print("\nStarting training...")
     trainer.train()
 
+    # Save final model
     if not args.no_save:
         try:
             model_path = os.path.join(args.output_dir, "final_model")
@@ -488,6 +496,7 @@ def main(args):
         except Exception as e:
             print(f"Error saving model: {e}")
 
+    # Final evaluation
     print("\nEvaluating final model...")
     results = trainer.evaluate()
     print("Final evaluation results:", results)
