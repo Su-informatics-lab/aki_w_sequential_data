@@ -204,22 +204,22 @@ class AKITrainer(Trainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
-        # Remove keys that the model does not expect.
-        for key in ["future_values", "future_observed_mask", "timestamp", "id"]:
-            if key in inputs:
-                inputs.pop(key)
-
         model_device = next(model.parameters()).device
 
-        if "target_values" not in inputs and "labels" in inputs:
-            inputs["target_values"] = inputs.pop("labels").to(model_device)
-        elif "target_values" not in inputs and "static_categorical_values" in inputs:
-            inputs["target_values"] = inputs["static_categorical_values"].long().to(
-                model_device)
-        elif "target_values" not in inputs:
-            batch_size = inputs["past_values"].size(0)
-            inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
-                                                  device=model_device)
+        # If target_values is not set, derive it from static_categorical_values if available.
+        if "target_values" not in inputs:
+            if "static_categorical_values" in inputs:
+                inputs["target_values"] = inputs["static_categorical_values"].long().to(
+                    model_device)
+            else:
+                batch_size = inputs["past_values"].size(0)
+                inputs["target_values"] = torch.zeros(batch_size, dtype=torch.long,
+                                                      device=model_device)
+
+        # Remove keys that the model does not expect.
+        for key in ["future_values", "future_observed_mask", "timestamp", "id",
+                    "static_categorical_values"]:
+            inputs.pop(key, None)
 
         # Debug logging: print unique target values for the first few evaluation batches.
         if not hasattr(self, "eval_batch_count"):
