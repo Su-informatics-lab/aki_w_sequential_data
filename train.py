@@ -44,7 +44,7 @@ Overall Process:
 +--------------------------------------------------------------+
               |
               | Wrap with ClassificationDataset to add a static AKI label,
-              | by matching the patient ID (from "id" or "ID") to the label mapping.
+              | by matching the patient ID (from "id") to the label mapping.
               v
 +--------------------------------------------------------------+
 |       ClassificationDataset (Custom Wrapper)                 |
@@ -209,8 +209,9 @@ class ClassificationDataset(Dataset):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        example = self.base_dataset[idx]
-        # Try to get patient ID from "id" then "ID"
+        # Convert the output of the base dataset to a mutable dictionary.
+        example = dict(self.base_dataset[idx])
+        # Try to obtain patient ID from "id" then "ID"
         patient_id = None
         if "id" in example:
             patient_id = example["id"]
@@ -235,19 +236,21 @@ def custom_data_collator(features):
     """
     Custom collate function to preserve all keys including 'labels'.
     """
-    # Debug: print keys from each feature
-    for i, f in enumerate(features):
-        print(f"[DEBUG] Feature {i} keys: {list(f.keys())}")
+    # Compute the union of all keys in the batch.
+    all_keys = set()
+    for f in features:
+        all_keys.update(f.keys())
     batch = {}
-    for key in features[0].keys():
+    for key in all_keys:
         if key == "labels":
-            batch[key] = torch.tensor([f[key] for f in features], dtype=torch.long)
+            batch[key] = torch.tensor([f.get(key) for f in features], dtype=torch.long)
         else:
+            # Try to stack if possible.
             try:
-                batch[key] = torch.stack([f[key] for f in features])
+                batch[key] = torch.stack([f.get(key) for f in features])
             except Exception as e:
                 print(f"[DEBUG] Could not stack key '{key}': {e}")
-                batch[key] = [f[key] for f in features]
+                batch[key] = [f.get(key) for f in features]
     print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
 
@@ -323,7 +326,7 @@ def main(args):
 
     print("Columns in preprocessed data:", all_patients_df.columns.tolist())
 
-    # Ensure an "id" column exists for downstream processing.
+    # Ensure an "id" column exists.
     all_patients_df["id"] = all_patients_df["ID"]
 
     # Filter out rows whose "ID" is not in the label mapping.
@@ -379,7 +382,7 @@ def main(args):
             print("[DEBUG] past_values shape:", sample["past_values"].shape)
         print("[DEBUG] labels:", sample["labels"])
 
-    # Create DataLoaders using the custom data collator.
+    # Create DataLoaders using our custom data collator.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=custom_data_collator)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=custom_data_collator)
 
