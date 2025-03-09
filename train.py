@@ -24,7 +24,7 @@ For further customization, refer to the argument parser help message.
     +------------------------------------------------------------------+
     |           Raw CSV Files (per patient)                            |
     |  - Each CSV contains a time series with 26 channels              |
-    |  - Patient ID is inferred from the filename (e.g., "R94657_...") |
+    |  - Patient ID is inferred from the filename (e.g., "R94657_...")   |
     +------------------------------------------------------------------+
                      │
                      │  Preprocessing:
@@ -40,8 +40,8 @@ For further customization, refer to the argument parser help message.
                      ▼
     +---------------------------------------------------------------------+
     |   Combined Preprocessed Data (Parquet file)                         |
-    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet") |
-    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26         |
+    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet")   |
+    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26           |
     +---------------------------------------------------------------------+
                      │
                      │  Split by patient IDs into Train & Validation sets
@@ -50,7 +50,7 @@ For further customization, refer to the argument parser help message.
     +-----------------------------------------------+
     |  PatientTimeSeriesDataset (Custom)            |
     |  Each sample is a dict with:                  |
-    |    - time_series: [fixed_length, 26] tensor   |
+    |    - time_series: [fixed_length, 26] tensor     |
     |      (normalized and imputed)                 |
     |    - label: scalar (AKI status)               |
     +-----------------------------------------------+
@@ -354,6 +354,7 @@ class AKI_LSTMClassifierWithAttention(nn.Module):
 
     def forward(self, x):
         rnn_out, (h_n, _) = self.lstm(x)
+        # Use attention over all time steps
         context, attn_weights = self.attention(rnn_out)
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
@@ -483,7 +484,7 @@ class AKI_GRUClassifierWithAttention(nn.Module):
 def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 class_weights, patience=5):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
-                                  weight_decay=0.1)
+                                  weight_decay=args.weight_decay)
     best_val_loss = float('inf')
     best_val_f1 = 0.0
     best_model_state = None
@@ -806,7 +807,6 @@ def main(args):
                 use_layernorm=args.layernorm,
             ).to(device)
 
-    # append run name info to the checkpoint folder
     ckpt_folder = os.path.join(args.output_dir, run_name)
     os.makedirs(ckpt_folder, exist_ok=True)
 
@@ -897,8 +897,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-5,
-        help="Learning rate",
+        default=1e-5,
+        help="Learning rate.",
     )
     parser.add_argument(
         "--num_workers",
@@ -935,6 +935,7 @@ if __name__ == "__main__":
         help="Directory to save model checkpoints.",
     )
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
+    # New flags for model variants
     parser.add_argument(
         "--attention",
         action="store_true",
@@ -945,6 +946,12 @@ if __name__ == "__main__":
         "--layernorm",
         action="store_true",
         help="Enable layer normalization (default: disabled).",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay to use in the optimizer (default: 0, no weight decay).",
     )
 
     args = parser.parse_args()
