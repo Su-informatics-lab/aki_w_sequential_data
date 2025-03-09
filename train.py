@@ -898,7 +898,7 @@ if __name__ == "__main__":
         "--learning_rate",
         type=float,
         default=3e-5,
-        help="Learning rate (default now 3e-5).",
+        help="Learning rate",
     )
     parser.add_argument(
         "--num_workers",
