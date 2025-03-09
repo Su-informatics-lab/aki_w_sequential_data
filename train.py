@@ -14,42 +14,39 @@ Overall Process:
                 │
                 │  Preprocessing:
                 │    - Add "time_idx" column (assume one row per second)
-                │    - Pool the time series over a 60-second window
-                │      (using the specified method) and then truncate/pad
-                │      to a fixed length (--fixed_length)
-                │    - Attach static AKI label using patient ID via Excel file
+                │    - (Optionally) Pool over a 60-second window using a chosen method
+                │    - Truncate/pad the result to a fixed length (--fixed_length)
+                │    - Attach static AKI label via patient ID from an Excel file
                 │
                 ▼
 +--------------------------------------------------------------+
-|       Combined Preprocessed Data (Parquet)                   |
-| Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26     |
+|    Combined Preprocessed Data (Parquet) with columns:        |
+|    ID, Acute_kidney_injury, time_idx, F1, F2, …, F26           |
 +--------------------------------------------------------------+
                 │
-                │  Split by patient ID into Train & Validation sets
-                │
-                ▼
-+--------------------------------------------------------------+
-|        PatientTimeSeriesDataset (custom Dataset)             |
-| Each sample is a dict with:                                  |
-|    - time_series: tensor of shape [fixed_length, 26]           |
-|    - label: scalar (AKI label)                                 |
-+--------------------------------------------------------------+
+                │  Split by patient IDs into Train & Validation sets
                 │
                 ▼
 +--------------------------------------------------------------+
-|       DataLoader (using custom collate function)             |
+|  PatientTimeSeriesDataset: Each sample is a dict with:       |
+|       - time_series: [fixed_length, 26] (float tensor)         |
+|       - label: scalar (AKI label)                              |
++--------------------------------------------------------------+
+                │
+                ▼
++--------------------------------------------------------------+
+|   DataLoader (batching samples via a custom collate function)  |
 +--------------------------------------------------------------+
                 │
                 ▼
 +--------------------------------------------------------------+
 |            AKI_LSTMClassifier Model (LSTM-based)             |
-|  Input: [batch, fixed_length, 26]                              |
-|  Outputs logits for binary classification                    |
+|  Input: [batch, fixed_length, 26] → logits for binary classes  |
 +--------------------------------------------------------------+
                 │
                 ▼
 +--------------------------------------------------------------+
-|          Training via Standard PyTorch Training Loop         |
+|        Standard PyTorch Training Loop with wandb logging     |
 +--------------------------------------------------------------+
 """
 
@@ -69,7 +66,9 @@ import wandb
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_fscore_support
 from collections import Counter
 
-# --- Data Preprocessing Functions ---
+##########################
+# Data Preprocessing Functions
+##########################
 
 def pool_minute(df, pool_window=60, pool_method="average"):
     """
@@ -116,12 +115,14 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
-# --- Custom Dataset ---
+##########################
+# Custom Dataset
+##########################
 class PatientTimeSeriesDataset(Dataset):
     """
     Custom dataset that reads individual patient CSV files, applies pooling (or truncation),
-    and returns a dict with:
-      - 'time_series': torch.FloatTensor of shape [fixed_length, num_features]
+    and returns a dictionary with:
+      - 'time_series': torch.FloatTensor of shape [fixed_length, num_features] (only observable features)
       - 'label': torch.LongTensor scalar representing the static AKI label
     """
     def __init__(self, file_list, label_dict, process_mode="pool", pool_window=60, pool_method="average", fixed_length=10800):
@@ -147,20 +148,23 @@ class PatientTimeSeriesDataset(Dataset):
         df["Acute_kidney_injury"] = int(self.label_dict[patient_id])
         if self.process_mode == "pool":
             df = pool_minute(df, pool_window=self.pool_window, pool_method=self.pool_method)
-            # After pooling, ensure fixed length by truncating/padding:
-            df = truncate_pad_series(df, fixed_length=self.fixed_length)
-        elif self.process_mode == "truncate":
-            df = truncate_pad_series(df, fixed_length=self.fixed_length)
+        # Always ensure fixed length:
+        df = truncate_pad_series(df, fixed_length=self.fixed_length)
         df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
-        # Extract observable features (exclude ID, label, time_idx)
+        # Observable features: exclude ID, label, time_idx
         feature_cols = [col for col in df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                         and np.issubdtype(df[col].dtype, np.number)]
-        # Convert feature values to torch tensor
+        # Convert features to torch tensor
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
+        # Debug print: if sample length doesn't match fixed_length, warn.
+        if time_series.shape[0] != self.fixed_length:
+            print(f"[WARNING] Sample {patient_id} has {time_series.shape[0]} rows instead of fixed {self.fixed_length}")
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"time_series": time_series, "label": label}
 
-# --- Custom Data Collator ---
+##########################
+# Custom Data Collator
+##########################
 def custom_data_collator(features):
     """
     Custom collate function that stacks "time_series" and "label" into batch tensors.
@@ -175,7 +179,9 @@ def custom_data_collator(features):
     print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
 
-# --- LSTM Model Definition ---
+##########################
+# LSTM-based Classifier Model
+##########################
 class AKI_LSTMClassifier(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.3):
         """
@@ -184,7 +190,7 @@ class AKI_LSTMClassifier(nn.Module):
             input_size (int): Number of observable channels.
             hidden_size (int): Hidden dimension.
             num_layers (int): Number of LSTM layers.
-            num_classes (int): Number of output classes.
+            num_classes (int): Number of output classes (2).
             dropout (float): Dropout probability.
         """
         super(AKI_LSTMClassifier, self).__init__()
@@ -207,7 +213,9 @@ class AKI_LSTMClassifier(nn.Module):
         logits = self.fc(h_last)
         return logits
 
-# --- Training Loop ---
+##########################
+# Training Loop
+##########################
 def train_model(model, train_loader, val_loader, device, epochs, learning_rate, class_weights):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     best_val_f1 = 0.0
@@ -217,8 +225,8 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
         model.train()
         train_losses = []
         for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training"):
-            time_series = batch["time_series"].to(device)  # [B, T, C]
-            labels = batch["label"].to(device)              # [B]
+            time_series = batch["time_series"].to(device)
+            labels = batch["label"].to(device)
             optimizer.zero_grad()
             outputs = model(time_series)
             loss = F.cross_entropy(outputs, labels, weight=class_weights.to(device))
@@ -253,7 +261,6 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
         print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
         wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "val_loss": avg_val_loss, "accuracy": acc, "auc": auc, "f1": f1})
 
-        # Save best model based on F1
         if f1 > best_val_f1:
             best_val_f1 = f1
             best_model_state = model.state_dict()
@@ -262,13 +269,15 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
         model.load_state_dict(best_model_state)
     return model
 
-# --- Main Function ---
+##########################
+# Main Function
+##########################
 def main(args):
     wandb.init(project="AKI_LSTM", config=vars(args))
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
 
-    # Load AKI labels from Excel and prepare label mapping.
+    # Load AKI labels from Excel.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
@@ -303,7 +312,6 @@ def main(args):
                                             pool_window=args.pool_window,
                                             pool_method=args.pool_method,
                                             fixed_length=args.fixed_length)
-    # Debug: inspect one sample.
     if args.debug and len(train_dataset) > 0:
         sample = train_dataset[0]
         print("[DEBUG] Sample keys:", list(sample.keys()))
@@ -311,8 +319,10 @@ def main(args):
         print("[DEBUG] Sample label:", sample["label"].item())
 
     # Create DataLoaders.
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=custom_data_collator)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=custom_data_collator)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, collate_fn=custom_data_collator)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, collate_fn=custom_data_collator)
 
     # Compute class weights.
     all_train_labels = [train_dataset[i]["label"].item() for i in range(len(train_dataset))]
@@ -329,10 +339,10 @@ def main(args):
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    # Determine fixed sequence length (history length) from dataset; all samples now have fixed_length rows.
+    # Determine fixed sequence length and input channels.
     history_length = train_dataset[0]["time_series"].shape[0]
-    print(f"History length (number of rows per patient): {history_length}")
     num_input_channels = train_dataset[0]["time_series"].shape[1]
+    print(f"History length (fixed): {history_length}")
     print(f"Number of input channels (observable features): {num_input_channels}")
 
     # Create LSTM model.
@@ -391,7 +401,7 @@ if __name__ == "__main__":
                         help="Number of worker processes for DataLoader.")
     # Hardware & debug options
     parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
-    parser.add_argument("--no_cuda", action="store_true", help="Do not use CUDA even if available.")
+    parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
     parser.add_argument("--debug", action="store_true", help="Debug mode: process fewer patients and print extra info.")
     parser.add_argument("--max_patients", type=int, default=10, help="Max patients to process in debug mode.")
     parser.add_argument("--output_dir", type=str, default="./lstm_checkpoints",
