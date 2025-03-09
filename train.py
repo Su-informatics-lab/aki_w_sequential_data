@@ -147,11 +147,16 @@ def compute_length_statistics(file_list, process_mode, pool_window, pool_method)
         except Exception as e:
             print(f"[WARNING] Error reading {f}: {e}")
             continue
+        # Add time index and patient ID based on the filename.
         df["time_idx"] = range(len(df))
+        patient_id = os.path.basename(f).split('_')[0].strip()
+        df["ID"] = patient_id
+
         if process_mode == "pool":
             df = pool_minute(df, pool_window=pool_window, pool_method=pool_method)
         lengths.append(len(df))
     return np.array(lengths)
+
 
 def compute_normalization_stats(dataset):
     """
