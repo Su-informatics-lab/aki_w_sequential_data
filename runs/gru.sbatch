@@ -19,3 +19,11 @@ python train.py --gru
 sleep 60
 
 python train.py --gru --attention
+
+sleep 60
+
+python train.py --gru --layernorm
+
+sleep 60
+
+python train.py --gru --layernorm --attention

@@ -19,3 +19,11 @@ python train.py
 sleep 60
 
 python train.py --attention
+
+sleep 60
+
+python train.py --layernorm --attention
+
+sleep 60
+
+python train.py --layernorm
