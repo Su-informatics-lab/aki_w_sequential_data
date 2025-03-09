@@ -3,56 +3,57 @@
 LSTM Classification for AKI Prediction via LSTM
 
 This script implements an LSTM-based classifier to predict Acute Kidney Injury (AKI)
-from multi-channel patient vital signs data. The overall pipeline is as follows:
+from multi-channel patient vital signs data. The pipeline is as follows:
 
-    +--------------------------------------------------------------+
-    |              Raw CSV Files (per patient)                     |
-    |  - Each CSV contains a time series with 26 channels          |
-    |  - Patient ID is inferred from the filename (e.g., "R94657_...")|
-    +--------------------------------------------------------------+
-                      │
-                      │  Preprocessing:
-                      │    - Add "time_idx" column (assume 1 row/second)
-                      │    - (Optional) Pool over a 60-second window
-                      │    - Compute sequence lengths and set a cap at a given percentile
-                      │         (e.g., 90th percentile becomes the fixed length)
-                      │    - Truncate sequences longer than the cap; pad shorter ones
-                      │    - Impute missing values with 0
-                      │    - (Optional) Normalize features (using training set statistics)
-                      │    - Attach static AKI label (from an Excel file)
-                      │
-                      ▼
-    +--------------------------------------------------------------+
-    |   Combined Preprocessed Data (saved as Parquet)              |
-    |  Filename: preprocessed_{cap_percentile}.parquet              |
-    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26    |
-    +--------------------------------------------------------------+
-                      │
-                      │  Split by patient IDs into Train & Validation sets
-                      │
-                      ▼
-    +--------------------------------------------------------------+
-    |     PatientTimeSeriesDataset (Custom)                        |
-    |  Each sample is a dict with:                                 |
-    |    - time_series: [fixed_length, 26] tensor (normalized)       |
-    |    - label: scalar (AKI status)                                |
-    +--------------------------------------------------------------+
-                      │
-                      ▼
-    +--------------------------------------------------------------+
-    |  DataLoader (with custom collate function)                   |
-    +--------------------------------------------------------------+
-                      │
-                      ▼
-    +--------------------------------------------------------------+
-    |        AKI_LSTMClassifier Model (LSTM-based)                 |
-    |  Input: [batch, fixed_length, 26] → logits for 2 classes       |
-    +--------------------------------------------------------------+
-                      │
-                      ▼
-    +--------------------------------------------------------------+
-    |    Standard PyTorch Training Loop with wandb logging         |
-    +--------------------------------------------------------------+
+    +-----------------------------------------------+
+    |           Raw CSV Files (per patient)         |
+    |  - Each CSV contains a time series with 26 channels           |
+    |  - Patient ID is inferred from the filename (e.g., "R94657_...") |
+    +-----------------------------------------------+
+                     │
+                     │  Preprocessing:
+                     │    - Add "time_idx" column (assumed 1 row/second)
+                     │    - (Optional) Pool over a 60-second window using a chosen method
+                     │    - Compute sequence lengths for all patients and set a cap at a given percentile
+                     │         (e.g., the 90th percentile of lengths becomes the fixed length)
+                     │    - Truncate sequences longer than the cap; pad shorter ones
+                     │    - Impute missing values with 0
+                     │    - (Optional) Normalize features (using training set statistics)
+                     │    - Attach static AKI label from an Excel file
+                     │
+                     ▼
+    +-----------------------------------------------+
+    |   Combined Preprocessed Data (Parquet file)   |
+    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet") |
+    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26      |
+    +-----------------------------------------------+
+                     │
+                     │  Split by patient IDs into Train & Validation sets
+                     │
+                     ▼
+    +-----------------------------------------------+
+    |  PatientTimeSeriesDataset (Custom)            |
+    |  Each sample is a dict with:                  |
+    |    - time_series: [fixed_length, 26] tensor     |
+    |      (normalized and imputed)                 |
+    |    - label: scalar (AKI status)                 |
+    +-----------------------------------------------+
+                     │
+                     ▼
+    +-----------------------------------------------+
+    |     DataLoader with custom collate_fn         |
+    +-----------------------------------------------+
+                     │
+                     ▼
+    +-----------------------------------------------+
+    |          AKI_LSTMClassifier Model             |
+    |  Input: [batch, fixed_length, 26]  --> logits  |
+    +-----------------------------------------------+
+                     │
+                     ▼
+    +-----------------------------------------------+
+    |  Standard PyTorch Training Loop with wandb    |
+    +-----------------------------------------------+
 
 Usage Example:
 --------------
@@ -92,11 +93,10 @@ from collections import Counter
 def pool_minute(df, pool_window=60, pool_method="average"):
     """
     Pool over non-overlapping windows using the specified method (ignoring NaNs).
-    Missing values are replaced with 0.
+    Returns a DataFrame with pooled rows.
     """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
-    feature_cols = [col for col in df.columns
-                    if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
+    feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
     n = len(df)
     num_windows = int(np.ceil(n / pool_window))
@@ -135,7 +135,7 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
-def compute_length_statistics(file_list, process_mode, pool_window, pool_method):
+def compute_length_statistics(file_list, process_mode, pool_window, pool_method, label_dict):
     """
     Compute sequence lengths (after pooling if enabled) for each file.
     Returns a numpy array of lengths.
@@ -147,31 +147,20 @@ def compute_length_statistics(file_list, process_mode, pool_window, pool_method)
         except Exception as e:
             print(f"[WARNING] Error reading {f}: {e}")
             continue
-        # Add time index and patient ID based on the filename.
         df["time_idx"] = range(len(df))
         patient_id = os.path.basename(f).split('_')[0].strip()
         df["ID"] = patient_id
-
+        # Add AKI label if missing
+        if "Acute_kidney_injury" not in df.columns:
+            if patient_id in label_dict:
+                df["Acute_kidney_injury"] = int(label_dict[patient_id])
+            else:
+                print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
+                continue
         if process_mode == "pool":
             df = pool_minute(df, pool_window=pool_window, pool_method=pool_method)
         lengths.append(len(df))
     return np.array(lengths)
-
-
-def compute_normalization_stats(dataset):
-    """
-    Compute per-channel mean and std over the entire dataset.
-    Assumes each sample is a dict with key "time_series" of shape [fixed_length, num_features].
-    Returns two torch tensors: means and stds.
-    """
-    all_data = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        all_data.append(sample["time_series"])
-    all_data = torch.stack(all_data, dim=0)
-    means = all_data.mean(dim=(0, 1))
-    stds = all_data.std(dim=(0, 1))
-    return means, stds
 
 ##########################
 # Custom Dataset
@@ -179,15 +168,13 @@ def compute_normalization_stats(dataset):
 class PatientTimeSeriesDataset(Dataset):
     """
     Custom dataset that reads patient CSV files, applies pooling/truncation,
-    imputes missing values with 0, and optionally normalizes features.
-
+    imputes missing values (with 0), and optionally normalizes features.
     Each sample is a dict with:
         - "time_series": FloatTensor of shape [fixed_length, num_features]
         - "label": LongTensor scalar (AKI status)
     """
-    def __init__(self, file_list, label_dict, fixed_length, process_mode="pool",
-                 pool_window=60, pool_method="average", normalize=False,
-                 feature_means=None, feature_stds=None):
+    def __init__(self, file_list, label_dict, fixed_length, process_mode="pool", pool_window=60, pool_method="average",
+                 normalize=False, feature_means=None, feature_stds=None):
         self.file_list = file_list
         self.label_dict = label_dict
         self.fixed_length = fixed_length
@@ -216,8 +203,7 @@ class PatientTimeSeriesDataset(Dataset):
         df = truncate_pad_series(df, fixed_length=self.fixed_length)
         df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
         # Use only observable features (exclude ID, label, time_idx)
-        feature_cols = [col for col in df.columns
-                        if col not in {"ID", "Acute_kidney_injury", "time_idx"}
+        feature_cols = [col for col in df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                         and np.issubdtype(df[col].dtype, np.number)]
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
         time_series = torch.nan_to_num(time_series, nan=0.0)
@@ -231,7 +217,7 @@ class PatientTimeSeriesDataset(Dataset):
 ##########################
 def custom_data_collator(features):
     """
-    Custom collate function that stacks "time_series" and "label" into batch tensors.
+    Custom collate function that stacks "time_series" and "label" from a list of examples.
     """
     batch = {}
     try:
@@ -300,6 +286,7 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
             train_losses.append(loss.item())
         avg_train_loss = np.mean(train_losses)
 
+        # Validation
         model.eval()
         val_losses = []
         all_preds = []
@@ -333,6 +320,23 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
     return model
 
 ##########################
+# Compute Normalization Statistics
+##########################
+def compute_normalization_stats(dataset):
+    """
+    Compute per-channel mean and std over the entire dataset.
+    Returns two torch tensors: means and stds.
+    """
+    all_data = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        all_data.append(sample["time_series"])
+    all_data = torch.stack(all_data, dim=0)
+    means = all_data.mean(dim=(0, 1))
+    stds = all_data.std(dim=(0, 1))
+    return means, stds
+
+##########################
 # Main Function
 ##########################
 def main(args):
@@ -353,24 +357,20 @@ def main(args):
         file_list = file_list[:args.max_patients]
     print(f"Found {len(file_list)} patient files.")
 
-    ##########################
-    # Preprocessing Phase
-    ##########################
-    # Create a filename for the preprocessed dataset using the cap percentile.
-    preprocessed_path = f"{os.path.splitext(args.preprocessed_path)[0]}_{int(args.cap_percentile)}.parquet"
+    # --- Preprocessing Phase ---
+    preprocessed_path = f"{args.preprocessed_path.split('.')[0]}_{args.cap_percentile}.parquet"
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
         unique_ids = all_patients_df["ID"].unique()
         print(f"Loaded preprocessed data for {len(unique_ids)} patients.")
         print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
-        fixed_length = all_patients_df.groupby("ID").size().median()  # approximate fixed length
+        fixed_length = all_patients_df.groupby("ID").size().median()  # or any fixed statistic
     else:
-        lengths = compute_length_statistics(file_list, args.process_mode, args.pool_window, args.pool_method)
+        lengths = compute_length_statistics(file_list, args.process_mode, args.pool_window, args.pool_method, label_dict)
         print(f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}")
-        fixed_length = int(np.percentile(lengths, args.cap_percentile))
-        print(f"Using cap percentile {args.cap_percentile} => fixed sequence length = {fixed_length}")
-
+        cap_length = int(np.percentile(lengths, args.cap_percentile))
+        print(f"Using cap percentile {args.cap_percentile} => fixed sequence length = {cap_length}")
         processed_samples = []
         for f in tqdm(file_list, desc="Preprocessing patient files", ncols=80):
             fname = os.path.basename(f)
@@ -388,7 +388,7 @@ def main(args):
             df["Acute_kidney_injury"] = int(label_dict[patient_id])
             if args.process_mode == "pool":
                 df = pool_minute(df, pool_window=args.pool_window, pool_method=args.pool_method)
-            df = truncate_pad_series(df, fixed_length=fixed_length)
+            df = truncate_pad_series(df, fixed_length=cap_length)
             df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
             processed_samples.append(df)
         if len(processed_samples) == 0:
@@ -399,36 +399,38 @@ def main(args):
         unique_ids = all_patients_df["ID"].unique()
         print(f"Processed data contains {len(unique_ids)} patients.")
         print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
+        fixed_length = cap_length
 
-    ##########################
-    # Split Data by Patient ID
-    ##########################
+    # Split data by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split)
-    print("Training label distribution (from data):", dict(all_patients_df[all_patients_df["ID"].isin(train_ids)]["Acute_kidney_injury"].value_counts()))
-    print("Validation label distribution (from data):", dict(all_patients_df[all_patients_df["ID"].isin(val_ids)]["Acute_kidney_injury"].value_counts()))
+    train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
+    val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
+    print("Training label distribution (from data):", dict(train_df["Acute_kidney_injury"].value_counts()))
+    print("Validation label distribution (from data):", dict(val_df["Acute_kidney_injury"].value_counts()))
 
-    ##########################
-    # Create Datasets
-    ##########################
-    train_files = [f for f in file_list if os.path.basename(f).split('_')[0].strip() in train_ids]
-    val_files = [f for f in file_list if os.path.basename(f).split('_')[0].strip() in val_ids]
+    # Create datasets.
+    train_dataset = PatientTimeSeriesDataset(
+        file_list=[f for f in file_list if os.path.basename(f).split('_')[0].strip() in train_ids],
+        label_dict=label_dict,
+        process_mode=args.process_mode,
+        pool_window=args.pool_window,
+        pool_method=args.pool_method,
+        fixed_length=fixed_length,
+        normalize=False
+    )
+    val_dataset = PatientTimeSeriesDataset(
+        file_list=[f for f in file_list if os.path.basename(f).split('_')[0].strip() in val_ids],
+        label_dict=label_dict,
+        process_mode=args.process_mode,
+        pool_window=args.pool_window,
+        pool_method=args.pool_method,
+        fixed_length=fixed_length,
+        normalize=False
+    )
 
-    train_dataset = PatientTimeSeriesDataset(train_files, label_dict,
-                                             fixed_length=fixed_length,
-                                             process_mode=args.process_mode,
-                                             pool_window=args.pool_window,
-                                             pool_method=args.pool_method,
-                                             normalize=False)
-    val_dataset = PatientTimeSeriesDataset(val_files, label_dict,
-                                           fixed_length=fixed_length,
-                                           process_mode=args.process_mode,
-                                           pool_window=args.pool_window,
-                                           pool_method=args.pool_method,
-                                           normalize=False)
-
-    # Compute normalization statistics from training set and update datasets.
+    # Compute normalization statistics from training set.
     train_means, train_stds = compute_normalization_stats(train_dataset)
     print(f"[DEBUG] Computed normalization means: {train_means}")
     print(f"[DEBUG] Computed normalization stds: {train_stds}")
@@ -445,14 +447,13 @@ def main(args):
         print("[DEBUG] Sample time_series shape:", sample["time_series"].shape)
         print("[DEBUG] Sample label:", sample["label"].item())
 
+    # Create DataLoaders.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, collate_fn=custom_data_collator)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=custom_data_collator)
 
-    ##########################
-    # Compute Class Weights
-    ##########################
+    # Compute class weights.
     all_train_labels = [train_dataset[i]["label"].item() for i in range(len(train_dataset))]
     print("Training label distribution (dataset):", dict(Counter(all_train_labels)))
     def compute_class_weights(labels):
@@ -467,28 +468,20 @@ def main(args):
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    ##########################
-    # Determine Input Dimensions
-    ##########################
+    # Determine fixed sequence length and input channels.
     history_length = train_dataset[0]["time_series"].shape[0]
     num_input_channels = train_dataset[0]["time_series"].shape[1]
     print(f"History length (fixed): {history_length}")
     print(f"Number of input channels (observable features): {num_input_channels}")
 
     ##########################
-    # Build LSTM Model
+    # LSTM Model, Training and Evaluation
     ##########################
     model = AKI_LSTMClassifier(input_size=num_input_channels, hidden_size=128,
                                num_layers=2, num_classes=2, dropout=0.3).to(device)
-
-    ##########################
-    # Train Model
-    ##########################
     model = train_model(model, train_loader, val_loader, device, args.epochs, args.learning_rate, class_weights)
 
-    ##########################
-    # Final Evaluation
-    ##########################
+    # Final evaluation on validation set.
     model.eval()
     all_preds = []
     all_labels = []
@@ -507,6 +500,7 @@ def main(args):
         auc = 0.5
     print(f"Final Evaluation: Accuracy = {acc:.4f}, AUC = {auc:.4f}")
 
+    # Save final model.
     model_path = os.path.join(args.output_dir, "final_model.pt")
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
