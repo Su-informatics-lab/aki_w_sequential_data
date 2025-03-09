@@ -1,5 +1,5 @@
 #!/bin/sh
-#SBATCH --job-name=train_lstm
+#SBATCH --job-name=train_lstm_no_weight_decay
 #SBATCH --partition=gpuunsafe
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
