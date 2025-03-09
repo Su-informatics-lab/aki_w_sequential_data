@@ -1,9 +1,29 @@
-#!/usr/bin/env python
 """
-LSTM Classification for AKI Prediction via LSTM
+LSTM/GRU Classification for AKI Prediction via Recurrent Neural Networks
 
-This script implements an LSTM-based classifier to predict Acute Kidney Injury (AKI)
-from multi-channel patient vital signs data. The pipeline is as follows:
+This module implements a recurrent classifier (LSTM or GRU) to predict Acute Kidney Injury (AKI)
+from multi-channel patient vital signs data. The pipeline includes preprocessing patient CSV files,
+pooling/truncating time series to a fixed length, normalizing features based on training set statistics,
+and splitting data into training and validation sets. The model architecture includes residual connections,
+layer normalization, dropout, and optionally an attention mechanism on top of the recurrent layer.
+
+Usage Examples:
+
+    # 1. Use default LSTM (2 layers) without attention:
+    $ python train.py --data_dir "time_series_data_LSTM_10_29_2024" --epochs 50
+
+    # 2. Use LSTM with attention mechanism (2 layers):
+    $ python train.py --data_dir "time_series_data_LSTM_10_29_2024" --epochs 50 --attention
+
+    # 3. Use GRU (2 layers) without attention:
+    $ python train.py --data_dir "time_series_data_LSTM_10_29_2024" --epochs 50 --gru
+
+    # 4. Use GRU with attention mechanism (2 layers):
+    $ python train.py --data_dir "time_series_data_LSTM_10_29_2024" --epochs 50 --gru --attention
+
+Additional command-line options include specifying the pooling method, batch size, learning rate,
+number of epochs, and output directory for model checkpoints. For further customization, refer to the
+argument parser help message.
 
     +-----------------------------------------------+
     |           Raw CSV Files (per patient)         |
@@ -46,8 +66,9 @@ from multi-channel patient vital signs data. The pipeline is as follows:
                      │
                      ▼
     +-----------------------------------------------+
-    |          AKI_LSTMClassifier Model             |
-    |  Input: [batch, fixed_length, 26]  --> logits  |
+    |         Recurrent Classifier Model            |
+    |  Options: LSTM/GRU, with or without attention   |
+    |  Input: [batch, fixed_length, 26]  --> logits    |
     +-----------------------------------------------+
                      │
                      ▼
@@ -77,10 +98,6 @@ from collections import Counter
 # Data Preprocessing Functions
 ##########################
 def pool_minute(df, pool_window=60, pool_method="average"):
-    """
-    Pool over non-overlapping windows using the specified method (ignoring NaNs).
-    Returns a DataFrame with pooled rows.
-    """
     exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
     feature_cols = [col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
@@ -107,9 +124,6 @@ def pool_minute(df, pool_window=60, pool_method="average"):
     return pd.DataFrame(pooled_data)
 
 def truncate_pad_series(df, fixed_length, pad_value=0):
-    """
-    Truncate or pad DataFrame to exactly fixed_length rows.
-    """
     current_length = len(df)
     if current_length >= fixed_length:
         return df.iloc[:fixed_length].copy()
@@ -122,10 +136,6 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         return pd.concat([df, pad_df], ignore_index=True)
 
 def compute_length_statistics(file_list, process_mode, pool_window, pool_method, label_dict):
-    """
-    Compute sequence lengths (after pooling if enabled) for each file.
-    Returns a numpy array of lengths.
-    """
     lengths = []
     for f in tqdm(file_list, desc="Computing sequence lengths", ncols=80):
         try:
@@ -136,7 +146,6 @@ def compute_length_statistics(file_list, process_mode, pool_window, pool_method,
         df["time_idx"] = range(len(df))
         patient_id = os.path.basename(f).split('_')[0].strip()
         df["ID"] = patient_id
-        # Add AKI label if missing
         if "Acute_kidney_injury" not in df.columns:
             if patient_id in label_dict:
                 df["Acute_kidney_injury"] = int(label_dict[patient_id])
@@ -152,13 +161,6 @@ def compute_length_statistics(file_list, process_mode, pool_window, pool_method,
 # Custom Dataset
 ##########################
 class PatientTimeSeriesDataset(Dataset):
-    """
-    Custom dataset that reads patient CSV files, applies pooling/truncation,
-    imputes missing values (with 0), and optionally normalizes features.
-    Each sample is a dict with:
-        - "time_series": FloatTensor of shape [fixed_length, num_features]
-        - "label": LongTensor scalar (AKI status)
-    """
     def __init__(self, file_list, label_dict, fixed_length, process_mode="pool", pool_window=60, pool_method="average",
                  normalize=False, feature_means=None, feature_stds=None):
         self.file_list = file_list
@@ -188,7 +190,6 @@ class PatientTimeSeriesDataset(Dataset):
             df = pool_minute(df, pool_window=self.pool_window, pool_method=self.pool_method)
         df = truncate_pad_series(df, fixed_length=self.fixed_length)
         df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
-        # Use only observable features (exclude ID, label, time_idx)
         feature_cols = [col for col in df.columns if col not in {"ID", "Acute_kidney_injury", "time_idx"}
                         and np.issubdtype(df[col].dtype, np.number)]
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
@@ -202,9 +203,6 @@ class PatientTimeSeriesDataset(Dataset):
 # Custom Data Collator
 ##########################
 def custom_data_collator(features):
-    """
-    Custom collate function that stacks "time_series" and "label" from a list of examples.
-    """
     batch = {}
     try:
         batch["time_series"] = torch.stack([f["time_series"] for f in features])
@@ -216,80 +214,165 @@ def custom_data_collator(features):
     return batch
 
 ##########################
-# LSTM-based Classifier Model
+# Attention Module
 ##########################
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, rnn_outputs):
+        # rnn_outputs: [batch, time, hidden_size]
+        attn_scores = self.attn(rnn_outputs)  # [batch, time, 1]
+        attn_weights = torch.softmax(attn_scores, dim=1)  # [batch, time, 1]
+        context = torch.sum(attn_weights * rnn_outputs, dim=1)  # [batch, hidden_size]
+        return context, attn_weights
+
+##########################
+# Model Variants
+##########################
+# Vanilla LSTM
 class AKI_LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=3, num_classes=2, dropout=0.1):
-        """
-        LSTM-based classifier for AKI prediction.
-        Args:
-            input_size (int): Number of observable channels.
-            hidden_size (int): Hidden dimension.
-            num_layers (int): Number of LSTM layers.
-            num_classes (int): Number of output classes.
-            dropout (float): Dropout probability.
-        """
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1):
         super(AKI_LSTMClassifier, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
                             batch_first=True, dropout=dropout if num_layers > 1 else 0)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
-        # Add Layer Normalization on the hidden dimension
         self.layernorm = nn.LayerNorm(hidden_size)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
-        # x: [B, T, C]
         out, (h_n, _) = self.lstm(x)
-        h_last = h_n[-1]  # [B, hidden_size]
+        h_last = h_n[-1]
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
-        # Apply layer normalization
         h_last = self.layernorm(h_last)
         h_last = self.activation(h_last)
         h_last = self.dropout(h_last)
         logits = self.fc(h_last)
         return logits
 
+# LSTM with Attention
+class AKI_LSTMClassifierWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1):
+        super(AKI_LSTMClassifierWithAttention, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
+        self.layernorm = nn.LayerNorm(hidden_size)
+        self.attention = Attention(hidden_size)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        rnn_out, (h_n, _) = self.lstm(x)
+        # Use attention over all time steps
+        context, attn_weights = self.attention(rnn_out)
+        if self.residual is not None:
+            residual = self.residual(x.mean(dim=1))
+            context = context + residual
+        context = self.layernorm(context)
+        context = self.activation(context)
+        context = self.dropout(context)
+        logits = self.fc(context)
+        return logits, attn_weights
+
+# Vanilla GRU
+class AKI_GRUClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1):
+        super(AKI_GRUClassifier, self).__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers,
+                          batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
+        self.layernorm = nn.LayerNorm(hidden_size)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        out, h_n = self.gru(x)
+        h_last = h_n[-1]
+        if self.residual is not None:
+            residual = self.residual(x.mean(dim=1))
+            h_last = h_last + residual
+        h_last = self.layernorm(h_last)
+        h_last = self.activation(h_last)
+        h_last = self.dropout(h_last)
+        logits = self.fc(h_last)
+        return logits
+
+# GRU with Attention
+class AKI_GRUClassifierWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1):
+        super(AKI_GRUClassifierWithAttention, self).__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers,
+                          batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
+        self.layernorm = nn.LayerNorm(hidden_size)
+        self.attention = Attention(hidden_size)
+        self.activation = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        rnn_out, h_n = self.gru(x)
+        context, attn_weights = self.attention(rnn_out)
+        if self.residual is not None:
+            residual = self.residual(x.mean(dim=1))
+            context = context + residual
+        context = self.layernorm(context)
+        context = self.activation(context)
+        context = self.dropout(context)
+        logits = self.fc(context)
+        return logits, attn_weights
+
 ##########################
-# Training Loop
+# Training Loop with Early Stopping
 ##########################
-def train_model(model, train_loader, val_loader, device, epochs, learning_rate, class_weights):
-    # Use AdamW with weight decay of 0.1 and updated learning rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
+def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
+                class_weights, patience=5):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
+                                  weight_decay=0.1)
+    best_val_loss = float('inf')
     best_val_f1 = 0.0
     best_model_state = None
+    no_improvement_count = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80, leave=False):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80,
+                          leave=False):
             time_series = batch["time_series"].to(device)
             labels = batch["label"].to(device)
             optimizer.zero_grad()
             outputs = model(time_series)
-            loss = F.cross_entropy(outputs, labels, weight=class_weights.to(device))
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            loss = F.cross_entropy(logits, labels, weight=class_weights.to(device))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_losses.append(loss.item())
         avg_train_loss = np.mean(train_losses)
 
-        # Validation
         model.eval()
         val_losses = []
         all_preds = []
         all_labels = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80, leave=False):
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80,
+                              leave=False):
                 time_series = batch["time_series"].to(device)
                 labels = batch["label"].to(device)
                 outputs = model(time_series)
-                loss = F.cross_entropy(outputs, labels, weight=class_weights.to(device))
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                loss = F.cross_entropy(logits, labels, weight=class_weights.to(device))
                 val_losses.append(loss.item())
-                preds = torch.argmax(outputs, dim=-1)
+                preds = torch.argmax(logits, dim=-1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         avg_val_loss = np.mean(val_losses)
@@ -298,13 +381,28 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
             auc = roc_auc_score(all_labels, all_preds)
         except Exception:
             auc = 0.5
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', zero_division=0)
-        print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
-        wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
-                   "accuracy": acc, "auc": auc, "f1": f1})
-        if f1 > best_val_f1:
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
+                                                                   all_preds,
+                                                                   average='binary',
+                                                                   zero_division=0)
+        print(
+            f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
+        wandb.log(
+            {"epoch": epoch, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
+             "accuracy": acc, "auc": auc, "f1": f1})
+
+        # Early stopping check: if validation loss improves, save the model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             best_val_f1 = f1
             best_model_state = model.state_dict()
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+            if no_improvement_count >= patience:
+                print(
+                    f"Early stopping triggered at epoch {epoch} after {patience} epochs with no improvement.")
+                break
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -314,10 +412,6 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate, 
 # Compute Normalization Statistics
 ##########################
 def compute_normalization_stats(dataset):
-    """
-    Compute per-channel mean and std over the entire dataset.
-    Returns two torch tensors: means and stds.
-    """
     all_data = []
     for i in tqdm(range(len(dataset)), desc="Computing normalization stats"):
         sample = dataset[i]
@@ -331,16 +425,19 @@ def compute_normalization_stats(dataset):
 # Main Function
 ##########################
 def main(args):
-    wandb.init(project="AKI_LSTM", config=vars(args))
+    # Create a run name for wandb and checkpoint folder
+    model_type = "GRU" if args.gru else "LSTM"
+    attn_str = "_ATTN" if args.attention else ""
+    run_name = f"{model_type}{attn_str}_lr{args.learning_rate}_ep{args.epochs}"
+
+    wandb.init(project="AKI_LSTM", name=run_name, config=vars(args))
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
 
-    # Load AKI labels from Excel.
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels[["ID", "Acute_kidney_injury"]].drop_duplicates().dropna(subset=["Acute_kidney_injury"])
     label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])}
 
-    # Get list of CSV files with valid patient IDs.
     file_list = [os.path.join(args.data_dir, fname)
                  for fname in os.listdir(args.data_dir)
                  if fname.endswith(".csv") and fname.split('_')[0].strip() in label_dict]
@@ -348,7 +445,6 @@ def main(args):
         file_list = file_list[:args.max_patients]
     print(f"Found {len(file_list)} patient files.")
 
-    # --- Preprocessing Phase ---
     preprocessed_path = f"{args.preprocessed_path.split('.')[0]}_{args.cap_percentile}.parquet"
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
@@ -392,7 +488,6 @@ def main(args):
         print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
         fixed_length = cap_length
 
-    # Split data by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
     train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split)
@@ -401,7 +496,6 @@ def main(args):
     print("Training label distribution (from data):", dict(train_df["Acute_kidney_injury"].value_counts()))
     print("Validation label distribution (from data):", dict(val_df["Acute_kidney_injury"].value_counts()))
 
-    # Create datasets.
     train_dataset = PatientTimeSeriesDataset(
         file_list=[f for f in file_list if os.path.basename(f).split('_')[0].strip() in train_ids],
         label_dict=label_dict,
@@ -421,8 +515,6 @@ def main(args):
         normalize=False
     )
 
-    # Compute normalization statistics from training set.
-    # Save and load computed vectors to avoid re-computation.
     norm_stats_file = os.path.join(args.output_dir, "normalization_stats.pkl")
     if os.path.exists(norm_stats_file):
         with open(norm_stats_file, "rb") as f:
@@ -453,13 +545,11 @@ def main(args):
         print("[DEBUG] Sample time_series shape:", sample["time_series"].shape)
         print("[DEBUG] Sample label:", sample["label"].item())
 
-    # Create DataLoaders.
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, collate_fn=custom_data_collator)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=custom_data_collator)
 
-    # Compute class weights.
     all_train_labels = [train_dataset[i]["label"].item() for i in range(len(train_dataset))]
     print("Training label distribution (dataset):", dict(Counter(all_train_labels)))
     def compute_class_weights(labels):
@@ -469,26 +559,40 @@ def main(args):
         if n_classes < 2:
             return torch.tensor([1.0, 1.0], dtype=torch.float)
         weights = n_samples / (n_classes * counts)
-        weight_dict = {int(k): w for k, w in zip(unique, weights)}
+        weight_dict = {int(k): w for k, w in zip(unique, counts)}
         return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)], dtype=torch.float)
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
 
-    # Determine fixed sequence length and input channels.
     history_length = train_dataset[0]["time_series"].shape[0]
     num_input_channels = train_dataset[0]["time_series"].shape[1]
     print(f"History length (fixed): {history_length}")
     print(f"Number of input channels (observable features): {num_input_channels}")
 
-    ##########################
-    # LSTM Model, Training and Evaluation
-    ##########################
-    model = AKI_LSTMClassifier(input_size=num_input_channels, hidden_size=128,
-                               num_layers=3, num_classes=2, dropout=0.1).to(device)
-    # Updated learning rate default now passed from args (default: 1e-4)
-    model = train_model(model, train_loader, val_loader, device, args.epochs, args.learning_rate, class_weights)
+    # Model instantiation based on flags.
+    # By default, use LSTM; if --gru then use GRU.
+    # If --attention flag is passed, use the corresponding attention variant.
+    if args.gru:
+        if args.attention:
+            model = AKI_GRUClassifierWithAttention(input_size=num_input_channels, hidden_size=128,
+                                                   num_layers=2, num_classes=2, dropout=0.1).to(device)
+        else:
+            model = AKI_GRUClassifier(input_size=num_input_channels, hidden_size=128,
+                                      num_layers=2, num_classes=2, dropout=0.1).to(device)
+    else:
+        if args.attention:
+            model = AKI_LSTMClassifierWithAttention(input_size=num_input_channels, hidden_size=128,
+                                                    num_layers=2, num_classes=2, dropout=0.1).to(device)
+        else:
+            model = AKI_LSTMClassifier(input_size=num_input_channels, hidden_size=128,
+                                       num_layers=2, num_classes=2, dropout=0.1).to(device)
 
-    # Final evaluation on validation set.
+    # Append run name info to the checkpoint folder
+    ckpt_folder = os.path.join(args.output_dir, run_name)
+    os.makedirs(ckpt_folder, exist_ok=True)
+
+    model = train_model(model, train_loader, val_loader, device, args.epochs, args.learning_rate, class_weights, patience=args.patience)
+
     model.eval()
     all_preds = []
     all_labels = []
@@ -497,7 +601,11 @@ def main(args):
             time_series = batch["time_series"].to(device)
             labels = batch["label"].to(device)
             outputs = model(time_series)
-            preds = torch.argmax(outputs, dim=-1)
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
+            preds = torch.argmax(logits, dim=-1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     acc = accuracy_score(all_labels, all_preds)
@@ -507,11 +615,10 @@ def main(args):
         auc = 0.5
     print(f"Final Evaluation: Accuracy = {acc:.4f}, AUC = {auc:.4f}")
 
-    # Save final model.
-    model_path = os.path.join(args.output_dir, "final_model.pt")
+    model_path = os.path.join(ckpt_folder, "final_model.pt")
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
-    wandb.log({"final_accuracy": acc, "final_auc": auc})
+    wandb.log({"final_accuracy": acc, "final_auc": auc, "checkpoint_path": model_path})
     return model
 
 if __name__ == "__main__":
@@ -531,11 +638,13 @@ if __name__ == "__main__":
                         help="Cap percentile to determine fixed sequence length from the distribution of sequence lengths.")
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-4,
                         help="Learning rate (default now 1e-4).")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Number of epochs with no improvement on validation loss before early stopping.")
     # Hardware & debug options
     parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
     parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
@@ -544,6 +653,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./lstm_checkpoints",
                         help="Directory to save model checkpoints.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
+    # New flags for model variants
+    parser.add_argument("--attention", action="store_true", help="Use attention mechanism on top of the recurrent layer.")
+    parser.add_argument("--gru", action="store_true", help="Use GRU instead of LSTM.")
 
     args = parser.parse_args()
     main(args)
