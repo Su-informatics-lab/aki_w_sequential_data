@@ -466,7 +466,7 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
     parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
     parser.add_argument("--debug", action="store_true", help="Debug mode: process fewer patients and print extra info.")
-    parser.add_argument("--max_patients", type=int, default=10, help="Max patients to process in debug mode.")
+    parser.add_argument("--max_patients", type=int, default=100, help="Max patients to process in debug mode.")
     parser.add_argument("--output_dir", type=str, default="./lstm_checkpoints",
                         help="Directory to save model checkpoints.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
