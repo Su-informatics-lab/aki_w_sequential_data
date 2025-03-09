@@ -54,21 +54,6 @@ from multi-channel patient vital signs data. The pipeline is as follows:
     +-----------------------------------------------+
     |  Standard PyTorch Training Loop with wandb    |
     +-----------------------------------------------+
-
-Usage Example:
---------------
-python train.py \
-  --data_dir "time_series_data_LSTM_10_29_2024" \
-  --process_mode "pool" \
-  --pool_window 60 \
-  --pool_method "average" \
-  --cap_percentile 90 \
-  --batch_size 32 \
-  --epochs 50 \
-  --learning_rate 1e-5 \
-  --output_dir "./lstm_checkpoints" \
-  --cuda 0 \
-  --debug
 """
 
 import os
@@ -234,7 +219,7 @@ def custom_data_collator(features):
 # LSTM-based Classifier Model
 ##########################
 class AKI_LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.3):
+    def __init__(self, input_size, hidden_size=128, num_layers=3, num_classes=2, dropout=0.1):
         """
         LSTM-based classifier for AKI prediction.
         Args:
@@ -248,6 +233,8 @@ class AKI_LSTMClassifier(nn.Module):
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
                             batch_first=True, dropout=dropout if num_layers > 1 else 0)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
+        # Add Layer Normalization on the hidden dimension
+        self.layernorm = nn.LayerNorm(hidden_size)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, num_classes)
@@ -259,6 +246,8 @@ class AKI_LSTMClassifier(nn.Module):
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
+        # Apply layer normalization
+        h_last = self.layernorm(h_last)
         h_last = self.activation(h_last)
         h_last = self.dropout(h_last)
         logits = self.fc(h_last)
@@ -268,7 +257,8 @@ class AKI_LSTMClassifier(nn.Module):
 # Training Loop
 ##########################
 def train_model(model, train_loader, val_loader, device, epochs, learning_rate, class_weights):
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Use AdamW with weight decay of 0.1 and updated learning rate
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
     best_val_f1 = 0.0
     best_model_state = None
 
@@ -365,10 +355,8 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         unique_ids = all_patients_df["ID"].unique()
         print(f"Loaded preprocessed data for {len(unique_ids)} patients.")
-        print("Label distribution:",
-              dict(all_patients_df["Acute_kidney_injury"].value_counts()))
-        fixed_length = int(
-            all_patients_df.groupby("ID").size().median())
+        print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
+        fixed_length = int(all_patients_df.groupby("ID").size().median())
     else:
         lengths = compute_length_statistics(file_list, args.process_mode, args.pool_window, args.pool_method, label_dict)
         print(f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}")
@@ -496,7 +484,8 @@ def main(args):
     # LSTM Model, Training and Evaluation
     ##########################
     model = AKI_LSTMClassifier(input_size=num_input_channels, hidden_size=128,
-                               num_layers=2, num_classes=2, dropout=0.3).to(device)
+                               num_layers=3, num_classes=2, dropout=0.1).to(device)
+    # Updated learning rate default now passed from args (default: 1e-4)
     model = train_model(model, train_loader, val_loader, device, args.epochs, args.learning_rate, class_weights)
 
     # Final evaluation on validation set.
@@ -543,7 +532,8 @@ if __name__ == "__main__":
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--learning_rate", type=float, default=1e-4,
+                        help="Learning rate (default now 1e-4).")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
     # Hardware & debug options
