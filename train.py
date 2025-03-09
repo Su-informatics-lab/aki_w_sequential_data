@@ -73,6 +73,7 @@ python train.py \
 
 import os
 import argparse
+import pickle
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -328,7 +329,7 @@ def compute_normalization_stats(dataset):
     Returns two torch tensors: means and stds.
     """
     all_data = []
-    for i in range(len(dataset)):
+    for i in tqdm(range(len(dataset)), desc="Computing normalization stats"):
         sample = dataset[i]
         all_data.append(sample["time_series"])
     all_data = torch.stack(all_data, dim=0)
@@ -431,9 +432,24 @@ def main(args):
     )
 
     # Compute normalization statistics from training set.
-    train_means, train_stds = compute_normalization_stats(train_dataset)
-    print(f"[DEBUG] Computed normalization means: {train_means}")
-    print(f"[DEBUG] Computed normalization stds: {train_stds}")
+    # Save and load computed vectors to avoid re-computation.
+    norm_stats_file = os.path.join(args.output_dir, "normalization_stats.pkl")
+    if os.path.exists(norm_stats_file):
+        with open(norm_stats_file, "rb") as f:
+            stats = pickle.load(f)
+        train_means = stats["means"]
+        train_stds = stats["stds"]
+        print(f"[DEBUG] Loaded normalization stats from {norm_stats_file}")
+    else:
+        train_means, train_stds = compute_normalization_stats(train_dataset)
+        print(f"[DEBUG] Computed normalization means: {train_means}")
+        print(f"[DEBUG] Computed normalization stds: {train_stds}")
+        stats = {"means": train_means, "stds": train_stds}
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(norm_stats_file, "wb") as f:
+            pickle.dump(stats, f)
+        print(f"[DEBUG] Saved normalization stats to {norm_stats_file}")
+
     train_dataset.normalize = True
     train_dataset.feature_means = train_means
     train_dataset.feature_stds = train_stds
