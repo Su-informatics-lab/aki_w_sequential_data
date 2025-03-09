@@ -365,8 +365,10 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         unique_ids = all_patients_df["ID"].unique()
         print(f"Loaded preprocessed data for {len(unique_ids)} patients.")
-        print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
-        fixed_length = all_patients_df.groupby("ID").size().median()  # or any fixed statistic
+        print("Label distribution:",
+              dict(all_patients_df["Acute_kidney_injury"].value_counts()))
+        fixed_length = int(
+            all_patients_df.groupby("ID").size().median())
     else:
         lengths = compute_length_statistics(file_list, args.process_mode, args.pool_window, args.pool_method, label_dict)
         print(f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}")
