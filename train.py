@@ -1,21 +1,22 @@
 """
-LSTM/GRU Classification for AKI Prediction via Recurrent Neural Networks
+LSTM/GRU Classification for Disease Prediction via Recurrent Neural Networks
 
-This module implements a recurrent classifier (LSTM or GRU) to predict Acute Kidney
-Injury (AKI) from multi-channel patient vital signs data. The pipeline includes
+This module implements a recurrent classifier (LSTM or GRU) to predict various diseases
+(e.g., Acute Kidney Injury (AKI), Atrial Fibrillation (AF), Pneumonia, Postoperative Delirium (PD),
+or POD30 Death) from multi-channel patient vital signs data. The pipeline includes
 preprocessing patient CSV files, pooling/truncating time series to a fixed length,
 normalizing features based on training set statistics, and splitting data into training
 and validation sets. The model architecture includes residual connections, optional layer
-normalization, dropout, and optionally an attention mechanism on top of the recurrent
-layer.
+normalization, dropout, and optionally an attention mechanism on top of the recurrent layer.
+It also supports bidirectional RNNs.
 
 Usage Examples:
 
-    # use default LSTM (2 layers) without attention or layer normalization:
+    # use default LSTM (2 layers) without attention, layer normalization, or bidirectionality:
     $ python train.py
 
-    # use GRU with attention mechanism and layer normalization:
-    $ python train.py --gru --attention --layernorm
+    # use GRU with attention, layer normalization, and bidirectional setting:
+    $ python train.py --gru --attention --layernorm --bidirectional
 
 Additional command-line options include specifying the pooling method, batch size,
 learning rate, number of epochs, and output directory for model checkpoints.
@@ -24,7 +25,7 @@ For further customization, refer to the argument parser help message.
     +------------------------------------------------------------------+
     |           Raw CSV Files (per patient)                            |
     |  - Each CSV contains a time series with 26 channels              |
-    |  - Patient ID is inferred from the filename (e.g., "R94657_...") |
+    |  - Patient ID is inferred from the filename (e.g., "R94657_...")   |
     +------------------------------------------------------------------+
                      │
                      │  Preprocessing:
@@ -35,13 +36,13 @@ For further customization, refer to the argument parser help message.
                      │    - Truncate sequences longer than the cap; pad shorter ones
                      │    - Impute missing values with 0
                      │    - (Optional) Normalize features (using training set statistics)
-                     │    - Attach static AKI label from an Excel file
+                     │    - Attach disease label from an Excel file (column depends on chosen disease)
                      │
                      ▼
     +---------------------------------------------------------------------+
     |   Combined Preprocessed Data (Parquet file)                         |
-    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet") |
-    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26         |
+    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet")   |
+    |  Columns: ID, <Disease>, time_idx, F1, F2, …, F26                    |
     +---------------------------------------------------------------------+
                      │
                      │  Split by patient IDs into Train & Validation sets
@@ -50,9 +51,9 @@ For further customization, refer to the argument parser help message.
     +-----------------------------------------------+
     |  PatientTimeSeriesDataset (Custom)            |
     |  Each sample is a dict with:                  |
-    |    - time_series: [fixed_length, 26] tensor   |
+    |    - time_series: [fixed_length, 26] tensor     |
     |      (normalized and imputed)                 |
-    |    - label: scalar (AKI status)               |
+    |    - label: scalar (<Disease> status)          |
     +-----------------------------------------------+
                      │
                      ▼
@@ -62,10 +63,11 @@ For further customization, refer to the argument parser help message.
                      │
                      ▼
     +-----------------------------------------------+
-    |         Recurrent Classifier Model            |
-    |  Options: LSTM/GRU, with or without attention |
-    |  (optional layer normalization)               |
-    |  Input: [batch, fixed_length, 26]  --> logits |
+    |       Disease Recurrent Classifier Model      |
+    |  Options: LSTM/GRU, with or without attention,  |
+    |           optional layer normalization,       |
+    |           and bidirectional RNNs              |
+    |  Input: [batch, fixed_length, 26]  --> logits  |
     +-----------------------------------------------+
                      │
                      ▼
@@ -97,13 +99,9 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-
 ##########################
 # Disease Mapping
 ##########################
-# By default, "aki" -> "Acute_kidney_injury"
-# Other options: "af" -> "Atrial_fibrillation", "pneumonia" -> "Pneumonia",
-# "pd" -> "Postoperative_delirium", "pod30" -> "POD30_death"
 DISEASE_MAP = {
     "aki": "Acute_kidney_injury",
     "af": "Atrial_fibrillation",
@@ -112,15 +110,13 @@ DISEASE_MAP = {
     "pod30": "POD30_death"
 }
 
-
 ##########################
 # Data Preprocessing Functions
 ##########################
 def pool_minute(df, pool_window=60, pool_method="average"):
-    exclude_cols = {"ID", "time_idx"}  # We'll exclude the disease column dynamically
+    exclude_cols = {"ID", "time_idx"}  # Exclude ID and time_idx; disease column handled separately
     feature_cols = [
-        col
-        for col in df.columns
+        col for col in df.columns
         if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
     ]
     pooled_data = []
@@ -130,32 +126,24 @@ def pool_minute(df, pool_window=60, pool_method="average"):
         start = i * pool_window
         end = min((i + 1) * pool_window, n)
         window = df.iloc[start:end]
-        # We'll keep the disease column from the first row, if present
-        disease_col = [c for c in df.columns if c not in ("ID", "time_idx") and "injury" in c.lower() or "fibrillation" in c.lower() or "pneumonia" in c.lower() or "delirium" in c.lower() or "pod30" in c.lower()]
-        # If found, use that in the pooled row
         pooled_row = {
             "ID": window.iloc[0]["ID"],
             "time_idx": window["time_idx"].mean(),
         }
-        if disease_col:
-            # We'll just pick the first disease column found
-            pooled_row[disease_col[0]] = window.iloc[0][disease_col[0]]
-
+        # If a disease column exists, copy from the first row
+        disease_cols = [col for col in df.columns if col in DISEASE_MAP.values()]
+        if disease_cols:
+            pooled_row[disease_cols[0]] = window.iloc[0][disease_cols[0]]
         for col in feature_cols:
-            if col not in disease_col:  # skip disease col in features
-                valid_vals = window[col].dropna()
-                if pool_method == "average":
-                    pooled_row[col] = (
-                        np.nanmean(window[col]) if len(valid_vals) > 0 else 0.0
-                    )
-                elif pool_method == "max":
-                    pooled_row[col] = (
-                        np.nanmax(window[col]) if len(valid_vals) > 0 else 0.0
-                    )
-                elif pool_method == "median":
-                    pooled_row[col] = (
-                        np.nanmedian(window[col]) if len(valid_vals) > 0 else 0.0
-                    )
+            if disease_cols and col in disease_cols:
+                continue
+            valid_vals = window[col].dropna()
+            if pool_method == "average":
+                pooled_row[col] = np.nanmean(window[col]) if len(valid_vals) > 0 else 0.0
+            elif pool_method == "max":
+                pooled_row[col] = np.nanmax(window[col]) if len(valid_vals) > 0 else 0.0
+            elif pool_method == "median":
+                pooled_row[col] = np.nanmedian(window[col]) if len(valid_vals) > 0 else 0.0
         pooled_data.append(pooled_row)
     return pd.DataFrame(pooled_data)
 
@@ -168,20 +156,18 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df = pd.DataFrame(
             pad_value, index=range(fixed_length - current_length), columns=df.columns
         )
-        # We'll replicate the ID and disease column from the first row
-        for col in df.columns:
-            if col in ("ID",):
+        for col in ["ID"]:
+            if col in df.columns:
                 pad_df[col] = df.iloc[0][col]
-            # if col is the disease column, replicate as well
-            if col.lower() in ("acute_kidney_injury", "atrial_fibrillation", "pneumonia", "postoperative_delirium", "pod30_death"):
+        # Also replicate disease column if exists
+        for col in df.columns:
+            if col in DISEASE_MAP.values():
                 pad_df[col] = df.iloc[0][col]
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
 
-def compute_length_statistics(
-    file_list, process_mode, pool_window, pool_method, label_dict, disease_col
-):
+def compute_length_statistics(file_list, process_mode, pool_window, pool_method, label_dict, disease_col):
     lengths = []
     for f in tqdm(file_list, desc="Computing sequence lengths", ncols=80):
         try:
@@ -192,20 +178,16 @@ def compute_length_statistics(
         df["time_idx"] = range(len(df))
         patient_id = os.path.basename(f).split("_")[0].strip()
         df["ID"] = patient_id
-        # If the disease column doesn't exist, create it
         if disease_col not in df.columns:
             if patient_id in label_dict:
                 df[disease_col] = int(label_dict[patient_id])
             else:
-                print(
-                    f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping."
-                )
+                print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
                 continue
         if process_mode == "pool":
             df = pool_minute(df, pool_window=pool_window, pool_method=pool_method)
         lengths.append(len(df))
     return np.array(lengths)
-
 
 ##########################
 # Custom Dataset
@@ -245,42 +227,24 @@ class PatientTimeSeriesDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
-        # Make sure disease_col is present
         if patient_id not in self.label_dict:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
         if self.disease_col not in df.columns:
             df[self.disease_col] = int(self.label_dict[patient_id])
-
         if self.process_mode == "pool":
-            df = pool_minute(
-                df, pool_window=self.pool_window, pool_method=self.pool_method
-            )
+            df = pool_minute(df, pool_window=self.pool_window, pool_method=self.pool_method)
         df = truncate_pad_series(df, fixed_length=self.fixed_length)
-        # Convert disease column to int, if present
-        if self.disease_col in df.columns:
-            df[self.disease_col] = df[self.disease_col].astype(np.int64)
-
-        # Use only numeric features (exclude ID, time_idx, disease_col)
+        df[self.disease_col] = df[self.disease_col].astype(np.int64)
         exclude_cols = {"ID", "time_idx", self.disease_col}
         feature_cols = [
-            col
-            for col in df.columns
-            if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
+            col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
         ]
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
         time_series = torch.nan_to_num(time_series, nan=0.0)
-        if (
-            self.normalize
-            and self.feature_means is not None
-            and self.feature_stds is not None
-        ):
-            time_series = (time_series - self.feature_means) / (
-                self.feature_stds + 1e-8
-            )
-        # The label is the disease_col from label_dict
+        if self.normalize and self.feature_means is not None and self.feature_stds is not None:
+            time_series = (time_series - self.feature_means) / (self.feature_stds + 1e-8)
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"time_series": time_series, "label": label}
-
 
 ##########################
 # Custom Data Collator
@@ -314,33 +278,38 @@ class Attention(nn.Module):
 
 
 ##########################
-# Model Variants (unchanged)
+# Model Variants
 ##########################
-class AKI_LSTMClassifier(nn.Module):
-    def __init__(
-        self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
-    ):
-        super(AKI_LSTMClassifier, self).__init__()
+# Disease LSTM Classifier
+class Disease_LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+        super(Disease_LSTMClassifier, self).__init__()
+        self.bidirectional = bidirectional
         self.lstm = nn.LSTM(
             input_size,
             hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
         )
-        self.residual = (
-            nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
-        )
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
         if self.use_layernorm:
-            self.layernorm = nn.LayerNorm(hidden_size)
+            # if bidirectional, layernorm operates on 2*hidden_size
+            self.layernorm = nn.LayerNorm(hidden_size * 2 if bidirectional else hidden_size)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        out_dim = hidden_size * 2 if bidirectional else hidden_size
+        self.fc = nn.Linear(out_dim, num_classes)
 
     def forward(self, x):
         out, (h_n, _) = self.lstm(x)
-        h_last = h_n[-1]
+        if self.bidirectional:
+            # Concatenate the last forward and backward hidden states
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
@@ -353,7 +322,10 @@ class AKI_LSTMClassifier(nn.Module):
 
     def encode(self, x):
         out, (h_n, _) = self.lstm(x)
-        h_last = h_n[-1]
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
@@ -364,28 +336,29 @@ class AKI_LSTMClassifier(nn.Module):
         return h_last
 
 
-class AKI_LSTMClassifierWithAttention(nn.Module):
-    def __init__(
-        self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
-    ):
-        super(AKI_LSTMClassifierWithAttention, self).__init__()
+# Disease LSTM Classifier with Attention
+class Disease_LSTMClassifierWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+        super(Disease_LSTMClassifierWithAttention, self).__init__()
+        self.bidirectional = bidirectional
         self.lstm = nn.LSTM(
             input_size,
             hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
         )
-        self.residual = (
-            nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
-        )
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
+        out_dim = hidden_size * 2 if bidirectional else hidden_size
         if self.use_layernorm:
-            self.layernorm = nn.LayerNorm(hidden_size)
-        self.attention = Attention(hidden_size)
+            self.layernorm = nn.LayerNorm(out_dim)
+        attn_dim = out_dim
+        self.attention = Attention(attn_dim)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Linear(out_dim, num_classes)
 
     def forward(self, x):
         rnn_out, (h_n, _) = self.lstm(x)
@@ -413,31 +386,34 @@ class AKI_LSTMClassifierWithAttention(nn.Module):
         return context
 
 
-class AKI_GRUClassifier(nn.Module):
-    def __init__(
-        self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
-    ):
-        super(AKI_GRUClassifier, self).__init__()
+# Disease GRU Classifier
+class Disease_GRUClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+        super(Disease_GRUClassifier, self).__init__()
+        self.bidirectional = bidirectional
         self.gru = nn.GRU(
             input_size,
             hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
         )
-        self.residual = (
-            nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
-        )
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
+        out_dim = hidden_size * 2 if bidirectional else hidden_size
         if self.use_layernorm:
-            self.layernorm = nn.LayerNorm(hidden_size)
+            self.layernorm = nn.LayerNorm(out_dim)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Linear(out_dim, num_classes)
 
     def forward(self, x):
         out, h_n = self.gru(x)
-        h_last = h_n[-1]
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
@@ -450,7 +426,10 @@ class AKI_GRUClassifier(nn.Module):
 
     def encode(self, x):
         out, h_n = self.gru(x)
-        h_last = h_n[-1]
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
             h_last = h_last + residual
@@ -461,28 +440,28 @@ class AKI_GRUClassifier(nn.Module):
         return h_last
 
 
-class AKI_GRUClassifierWithAttention(nn.Module):
-    def __init__(
-        self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
-    ):
-        super(AKI_GRUClassifierWithAttention, self).__init__()
+# Disease GRU Classifier with Attention
+class Disease_GRUClassifierWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+        super(Disease_GRUClassifierWithAttention, self).__init__()
+        self.bidirectional = bidirectional
         self.gru = nn.GRU(
             input_size,
             hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
         )
-        self.residual = (
-            nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
-        )
+        self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
+        out_dim = hidden_size * 2 if bidirectional else hidden_size
         if self.use_layernorm:
-            self.layernorm = nn.LayerNorm(hidden_size)
-        self.attention = Attention(hidden_size)
+            self.layernorm = nn.LayerNorm(out_dim)
+        self.attention = Attention(out_dim)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Linear(out_dim, num_classes)
 
     def forward(self, x):
         rnn_out, h_n = self.gru(x)
@@ -610,14 +589,15 @@ def compute_normalization_stats(dataset):
 # Main Function
 ##########################
 def main(args):
-    # Decide which disease column to use
+    # decide which disease column to use
     disease_col = DISEASE_MAP[args.disease.lower()]
 
     # create a run name for wandb and checkpoint folder
     model_type = "GRU" if args.gru else "LSTM"
     attn_str = "_ATTN" if args.attention else ""
     ln_str = "_LN" if args.layernorm else ""
-    run_name = f"{args.disease.upper()}_{model_type}{attn_str}{ln_str}_lr{args.learning_rate}_ep{args.epochs}"
+    bi_str = "_BI" if args.bidirectional else ""
+    run_name = f"{args.disease.upper()}_{model_type}{attn_str}{ln_str}{bi_str}_lr{args.learning_rate}_ep{args.epochs}_dr{args.dropout}"
 
     wandb.init(project="AKI_LSTM", name=run_name, config=vars(args))
     device = torch.device(
@@ -625,7 +605,6 @@ def main(args):
     )
     print(f"Using device: {device}")
 
-    # Read Excel with multiple disease columns
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels.drop_duplicates().dropna(subset=[disease_col, "ID"])
     label_dict = {
@@ -652,8 +631,7 @@ def main(args):
         fixed_length = int(all_patients_df.groupby("ID").size().median())
     else:
         lengths = compute_length_statistics(
-            file_list, args.process_mode, args.pool_window, args.pool_method,
-            label_dict=label_dict, disease_col=disease_col
+            file_list, args.process_mode, args.pool_window, args.pool_method, label_dict, disease_col
         )
         print(
             f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}"
@@ -671,13 +649,11 @@ def main(args):
                 continue
             df["time_idx"] = range(len(df))
             df["ID"] = patient_id
-            # attach disease_col if missing
             if patient_id not in label_dict:
                 print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
                 continue
             if disease_col not in df.columns:
                 df[disease_col] = int(label_dict[patient_id])
-
             if args.process_mode == "pool":
                 df = pool_minute(df, pool_window=args.pool_window, pool_method=args.pool_method)
             df = truncate_pad_series(df, fixed_length=cap_length)
@@ -694,9 +670,7 @@ def main(args):
         fixed_length = cap_length
 
     unique_ids = all_patients_df["ID"].unique()
-    # Build labels_for_split from the label_dict
-    labels_for_split = [label_dict.get(str(pid).strip(), 0) for pid in unique_ids]
-
+    labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
     train_ids, val_ids = train_test_split(
         unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split
     )
@@ -781,7 +755,6 @@ def main(args):
         collate_fn=custom_data_collator,
     )
 
-    # Gather labels for class weighting
     all_train_labels = [
         train_dataset[i]["label"].item() for i in range(len(train_dataset))
     ]
@@ -807,49 +780,48 @@ def main(args):
     print(f"History length (fixed): {history_length}")
     print(f"Number of input channels (observable features): {num_input_channels}")
 
-    # Model instantiation based on flags (unchanged)
     if args.gru:
         if args.attention:
-            model = AKI_GRUClassifierWithAttention(
+            model = Disease_GRUClassifierWithAttention(
                 input_size=num_input_channels,
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
                 dropout=0.1,
                 use_layernorm=args.layernorm,
+                bidirectional=args.bidirectional,
             ).to(device)
         else:
-            model = AKI_GRUClassifier(
+            model = Disease_GRUClassifier(
                 input_size=num_input_channels,
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
                 dropout=0.1,
                 use_layernorm=args.layernorm,
+                bidirectional=args.bidirectional,
             ).to(device)
     else:
         if args.attention:
-            model = AKI_LSTMClassifierWithAttention(
+            model = Disease_LSTMClassifierWithAttention(
                 input_size=num_input_channels,
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
                 dropout=0.1,
                 use_layernorm=args.layernorm,
+                bidirectional=args.bidirectional,
             ).to(device)
         else:
-            model = AKI_LSTMClassifier(
+            model = Disease_LSTMClassifier(
                 input_size=num_input_channels,
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
                 dropout=0.1,
                 use_layernorm=args.layernorm,
+                bidirectional=args.bidirectional,
             ).to(device)
-
-    # Make sure the train_model function can access args.weight_decay
-    global args_for_train
-    args_for_train = args
 
     ckpt_folder = os.path.join(args.output_dir, run_name)
     os.makedirs(ckpt_folder, exist_ok=True)
@@ -979,6 +951,7 @@ if __name__ == "__main__":
         help="Directory to save model checkpoints.",
     )
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
+    # New flags for model variants
     parser.add_argument(
         "--attention",
         action="store_true",
@@ -996,9 +969,12 @@ if __name__ == "__main__":
         default=0.0,
         help="Weight decay to use in the optimizer (default: 0, no weight decay).",
     )
-
+    parser.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="Use bidirectional RNNs (default: disabled).",
+    )
     # New argument for disease
-    # Allowed: aki (default), af, pneumonia, pd, pod30
     parser.add_argument(
         "--disease",
         type=str,
