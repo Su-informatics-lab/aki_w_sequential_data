@@ -787,7 +787,7 @@ def main(args):
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
-                dropout=0.1,
+                dropout=args.dropout,
                 use_layernorm=args.layernorm,
                 bidirectional=args.bidirectional,
             ).to(device)
@@ -797,7 +797,7 @@ def main(args):
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
-                dropout=0.1,
+                dropout=args.dropout,
                 use_layernorm=args.layernorm,
                 bidirectional=args.bidirectional,
             ).to(device)
@@ -808,7 +808,7 @@ def main(args):
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
-                dropout=0.1,
+                dropout=args.dropout,
                 use_layernorm=args.layernorm,
                 bidirectional=args.bidirectional,
             ).to(device)
@@ -818,7 +818,7 @@ def main(args):
                 hidden_size=128,
                 num_layers=2,
                 num_classes=2,
-                dropout=0.1,
+                dropout=args.dropout,
                 use_layernorm=args.layernorm,
                 bidirectional=args.bidirectional,
             ).to(device)
@@ -981,6 +981,12 @@ if __name__ == "__main__":
         choices=["aki", "af", "pneumonia", "pd", "pod30"],
         default="aki",
         help="Which disease label to predict. Default: aki.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate (default: 0.1).",
     )
 
     args = parser.parse_args()
