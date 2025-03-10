@@ -1,5 +1,5 @@
 #!/bin/sh
-#SBATCH --job-name=baseliens
+#SBATCH --job-name=baselines
 #SBATCH --partition=gpuunsafe
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=16
@@ -15,16 +15,16 @@ module load CUDA/12.2.0
 . .venv/bin/activate
 
 
-# Variant 1: af, LSTM
+# af, LSTM
 python train.py --disease af &
 
-# Variant 1: pneumonia, LSTM
+# pneumonia, LSTM
 python train.py --disease pneumonia &
 
-# Variant 1: pd, LSTM
+# pd, LSTM
 python train.py --disease pd &
 
-# Variant 1: pod30, LSTM
+# pod30, LSTM
 python train.py --disease pod30 &
 
 wait
