@@ -24,7 +24,7 @@ For further customization, refer to the argument parser help message.
     +------------------------------------------------------------------+
     |           Raw CSV Files (per patient)                            |
     |  - Each CSV contains a time series with 26 channels              |
-    |  - Patient ID is inferred from the filename (e.g., "R94657_...")   |
+    |  - Patient ID is inferred from the filename (e.g., "R94657_...") |
     +------------------------------------------------------------------+
                      │
                      │  Preprocessing:
@@ -40,8 +40,8 @@ For further customization, refer to the argument parser help message.
                      ▼
     +---------------------------------------------------------------------+
     |   Combined Preprocessed Data (Parquet file)                         |
-    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet")   |
-    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26           |
+    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet") |
+    |  Columns: ID, Acute_kidney_injury, time_idx, F1, F2, …, F26         |
     +---------------------------------------------------------------------+
                      │
                      │  Split by patient IDs into Train & Validation sets
@@ -50,7 +50,7 @@ For further customization, refer to the argument parser help message.
     +-----------------------------------------------+
     |  PatientTimeSeriesDataset (Custom)            |
     |  Each sample is a dict with:                  |
-    |    - time_series: [fixed_length, 26] tensor     |
+    |    - time_series: [fixed_length, 26] tensor   |
     |      (normalized and imputed)                 |
     |    - label: scalar (AKI status)               |
     +-----------------------------------------------+
@@ -99,10 +99,25 @@ from tqdm import tqdm
 
 
 ##########################
+# Disease Mapping
+##########################
+# By default, "aki" -> "Acute_kidney_injury"
+# Other options: "af" -> "Atrial_fibrillation", "pneumonia" -> "Pneumonia",
+# "pd" -> "Postoperative_delirium", "pod30" -> "POD30_death"
+DISEASE_MAP = {
+    "aki": "Acute_kidney_injury",
+    "af": "Atrial_fibrillation",
+    "pneumonia": "Pneumonia",
+    "pd": "Postoperative_delirium",
+    "pod30": "POD30_death"
+}
+
+
+##########################
 # Data Preprocessing Functions
 ##########################
 def pool_minute(df, pool_window=60, pool_method="average"):
-    exclude_cols = {"ID", "Acute_kidney_injury", "time_idx"}
+    exclude_cols = {"ID", "time_idx"}  # We'll exclude the disease column dynamically
     feature_cols = [
         col
         for col in df.columns
@@ -115,25 +130,32 @@ def pool_minute(df, pool_window=60, pool_method="average"):
         start = i * pool_window
         end = min((i + 1) * pool_window, n)
         window = df.iloc[start:end]
+        # We'll keep the disease column from the first row, if present
+        disease_col = [c for c in df.columns if c not in ("ID", "time_idx") and "injury" in c.lower() or "fibrillation" in c.lower() or "pneumonia" in c.lower() or "delirium" in c.lower() or "pod30" in c.lower()]
+        # If found, use that in the pooled row
         pooled_row = {
             "ID": window.iloc[0]["ID"],
-            "Acute_kidney_injury": window.iloc[0]["Acute_kidney_injury"],
             "time_idx": window["time_idx"].mean(),
         }
+        if disease_col:
+            # We'll just pick the first disease column found
+            pooled_row[disease_col[0]] = window.iloc[0][disease_col[0]]
+
         for col in feature_cols:
-            valid_vals = window[col].dropna()
-            if pool_method == "average":
-                pooled_row[col] = (
-                    np.nanmean(window[col]) if len(valid_vals) > 0 else 0.0
-                )
-            elif pool_method == "max":
-                pooled_row[col] = (
-                    np.nanmax(window[col]) if len(valid_vals) > 0 else 0.0
-                )
-            elif pool_method == "median":
-                pooled_row[col] = (
-                    np.nanmedian(window[col]) if len(valid_vals) > 0 else 0.0
-                )
+            if col not in disease_col:  # skip disease col in features
+                valid_vals = window[col].dropna()
+                if pool_method == "average":
+                    pooled_row[col] = (
+                        np.nanmean(window[col]) if len(valid_vals) > 0 else 0.0
+                    )
+                elif pool_method == "max":
+                    pooled_row[col] = (
+                        np.nanmax(window[col]) if len(valid_vals) > 0 else 0.0
+                    )
+                elif pool_method == "median":
+                    pooled_row[col] = (
+                        np.nanmedian(window[col]) if len(valid_vals) > 0 else 0.0
+                    )
         pooled_data.append(pooled_row)
     return pd.DataFrame(pooled_data)
 
@@ -146,15 +168,19 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         pad_df = pd.DataFrame(
             pad_value, index=range(fixed_length - current_length), columns=df.columns
         )
-        for col in ["ID", "Acute_kidney_injury"]:
-            if col in df.columns:
+        # We'll replicate the ID and disease column from the first row
+        for col in df.columns:
+            if col in ("ID",):
+                pad_df[col] = df.iloc[0][col]
+            # if col is the disease column, replicate as well
+            if col.lower() in ("acute_kidney_injury", "atrial_fibrillation", "pneumonia", "postoperative_delirium", "pod30_death"):
                 pad_df[col] = df.iloc[0][col]
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
 
 
 def compute_length_statistics(
-    file_list, process_mode, pool_window, pool_method, label_dict
+    file_list, process_mode, pool_window, pool_method, label_dict, disease_col
 ):
     lengths = []
     for f in tqdm(file_list, desc="Computing sequence lengths", ncols=80):
@@ -166,9 +192,10 @@ def compute_length_statistics(
         df["time_idx"] = range(len(df))
         patient_id = os.path.basename(f).split("_")[0].strip()
         df["ID"] = patient_id
-        if "Acute_kidney_injury" not in df.columns:
+        # If the disease column doesn't exist, create it
+        if disease_col not in df.columns:
             if patient_id in label_dict:
-                df["Acute_kidney_injury"] = int(label_dict[patient_id])
+                df[disease_col] = int(label_dict[patient_id])
             else:
                 print(
                     f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping."
@@ -188,6 +215,7 @@ class PatientTimeSeriesDataset(Dataset):
         self,
         file_list,
         label_dict,
+        disease_col,
         fixed_length,
         process_mode="pool",
         pool_window=60,
@@ -198,6 +226,7 @@ class PatientTimeSeriesDataset(Dataset):
     ):
         self.file_list = file_list
         self.label_dict = label_dict
+        self.disease_col = disease_col
         self.fixed_length = fixed_length
         self.process_mode = process_mode
         self.pool_window = pool_window
@@ -216,20 +245,27 @@ class PatientTimeSeriesDataset(Dataset):
         df = pd.read_csv(csv_path)
         df["time_idx"] = range(len(df))
         df["ID"] = patient_id
+        # Make sure disease_col is present
         if patient_id not in self.label_dict:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
-        df["Acute_kidney_injury"] = int(self.label_dict[patient_id])
+        if self.disease_col not in df.columns:
+            df[self.disease_col] = int(self.label_dict[patient_id])
+
         if self.process_mode == "pool":
             df = pool_minute(
                 df, pool_window=self.pool_window, pool_method=self.pool_method
             )
         df = truncate_pad_series(df, fixed_length=self.fixed_length)
-        df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
+        # Convert disease column to int, if present
+        if self.disease_col in df.columns:
+            df[self.disease_col] = df[self.disease_col].astype(np.int64)
+
+        # Use only numeric features (exclude ID, time_idx, disease_col)
+        exclude_cols = {"ID", "time_idx", self.disease_col}
         feature_cols = [
             col
             for col in df.columns
-            if col not in {"ID", "Acute_kidney_injury", "time_idx"}
-            and np.issubdtype(df[col].dtype, np.number)
+            if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
         ]
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
         time_series = torch.nan_to_num(time_series, nan=0.0)
@@ -241,6 +277,7 @@ class PatientTimeSeriesDataset(Dataset):
             time_series = (time_series - self.feature_means) / (
                 self.feature_stds + 1e-8
             )
+        # The label is the disease_col from label_dict
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"time_series": time_series, "label": label}
 
@@ -277,9 +314,8 @@ class Attention(nn.Module):
 
 
 ##########################
-# Model Variants
+# Model Variants (unchanged)
 ##########################
-# Vanilla LSTM
 class AKI_LSTMClassifier(nn.Module):
     def __init__(
         self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
@@ -328,7 +364,6 @@ class AKI_LSTMClassifier(nn.Module):
         return h_last
 
 
-# LSTM with Attention
 class AKI_LSTMClassifierWithAttention(nn.Module):
     def __init__(
         self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
@@ -354,7 +389,6 @@ class AKI_LSTMClassifierWithAttention(nn.Module):
 
     def forward(self, x):
         rnn_out, (h_n, _) = self.lstm(x)
-        # Use attention over all time steps
         context, attn_weights = self.attention(rnn_out)
         if self.residual is not None:
             residual = self.residual(x.mean(dim=1))
@@ -379,7 +413,6 @@ class AKI_LSTMClassifierWithAttention(nn.Module):
         return context
 
 
-# Vanilla GRU
 class AKI_GRUClassifier(nn.Module):
     def __init__(
         self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
@@ -428,7 +461,6 @@ class AKI_GRUClassifier(nn.Module):
         return h_last
 
 
-# GRU with Attention
 class AKI_GRUClassifierWithAttention(nn.Module):
     def __init__(
         self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False
@@ -578,11 +610,14 @@ def compute_normalization_stats(dataset):
 # Main Function
 ##########################
 def main(args):
+    # Decide which disease column to use
+    disease_col = DISEASE_MAP[args.disease.lower()]
+
     # create a run name for wandb and checkpoint folder
     model_type = "GRU" if args.gru else "LSTM"
     attn_str = "_ATTN" if args.attention else ""
     ln_str = "_LN" if args.layernorm else ""
-    run_name = f"{model_type}{attn_str}{ln_str}_lr{args.learning_rate}_ep{args.epochs}"
+    run_name = f"{args.disease.upper()}_{model_type}{attn_str}{ln_str}_lr{args.learning_rate}_ep{args.epochs}"
 
     wandb.init(project="AKI_LSTM", name=run_name, config=vars(args))
     device = torch.device(
@@ -590,15 +625,12 @@ def main(args):
     )
     print(f"Using device: {device}")
 
+    # Read Excel with multiple disease columns
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
-    df_labels = (
-        df_labels[["ID", "Acute_kidney_injury"]]
-        .drop_duplicates()
-        .dropna(subset=["Acute_kidney_injury"])
-    )
+    df_labels = df_labels.drop_duplicates().dropna(subset=[disease_col, "ID"])
     label_dict = {
         str(x).strip(): int(y)
-        for x, y in zip(df_labels["ID"], df_labels["Acute_kidney_injury"])
+        for x, y in zip(df_labels["ID"], df_labels[disease_col])
     }
 
     file_list = [
@@ -616,11 +648,12 @@ def main(args):
         all_patients_df = pd.read_parquet(preprocessed_path)
         unique_ids = all_patients_df["ID"].unique()
         print(f"Loaded preprocessed data for {len(unique_ids)} patients.")
-        print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
+        print("Label distribution:", dict(all_patients_df[disease_col].value_counts()))
         fixed_length = int(all_patients_df.groupby("ID").size().median())
     else:
         lengths = compute_length_statistics(
-            file_list, args.process_mode, args.pool_window, args.pool_method, label_dict
+            file_list, args.process_mode, args.pool_window, args.pool_method,
+            label_dict=label_dict, disease_col=disease_col
         )
         print(
             f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}"
@@ -638,14 +671,17 @@ def main(args):
                 continue
             df["time_idx"] = range(len(df))
             df["ID"] = patient_id
+            # attach disease_col if missing
             if patient_id not in label_dict:
                 print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
                 continue
-            df["Acute_kidney_injury"] = int(label_dict[patient_id])
+            if disease_col not in df.columns:
+                df[disease_col] = int(label_dict[patient_id])
+
             if args.process_mode == "pool":
                 df = pool_minute(df, pool_window=args.pool_window, pool_method=args.pool_method)
             df = truncate_pad_series(df, fixed_length=cap_length)
-            df["Acute_kidney_injury"] = df["Acute_kidney_injury"].astype(np.int64)
+            df[disease_col] = df[disease_col].astype(np.int64)
             processed_samples.append(df)
         if len(processed_samples) == 0:
             raise ValueError("No patient files processed successfully.")
@@ -654,23 +690,23 @@ def main(args):
         print(f"Preprocessed data saved to {preprocessed_path}.")
         unique_ids = all_patients_df["ID"].unique()
         print(f"Processed data contains {len(unique_ids)} patients.")
-        print("Label distribution:", dict(all_patients_df["Acute_kidney_injury"].value_counts()))
+        print("Label distribution:", dict(all_patients_df[disease_col].value_counts()))
         fixed_length = cap_length
 
     unique_ids = all_patients_df["ID"].unique()
-    labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
+    # Build labels_for_split from the label_dict
+    labels_for_split = [label_dict.get(str(pid).strip(), 0) for pid in unique_ids]
+
     train_ids, val_ids = train_test_split(
         unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split
     )
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
     print(
-        "Training label distribution (from data):",
-        dict(train_df["Acute_kidney_injury"].value_counts()),
+        f"Training label distribution (from data): {dict(train_df[disease_col].value_counts())}"
     )
     print(
-        "Validation label distribution (from data):",
-        dict(val_df["Acute_kidney_injury"].value_counts()),
+        f"Validation label distribution (from data): {dict(val_df[disease_col].value_counts())}"
     )
 
     train_dataset = PatientTimeSeriesDataset(
@@ -680,6 +716,7 @@ def main(args):
             if os.path.basename(f).split("_")[0].strip() in train_ids
         ],
         label_dict=label_dict,
+        disease_col=disease_col,
         process_mode=args.process_mode,
         pool_window=args.pool_window,
         pool_method=args.pool_method,
@@ -691,6 +728,7 @@ def main(args):
             f for f in file_list if os.path.basename(f).split("_")[0].strip() in val_ids
         ],
         label_dict=label_dict,
+        disease_col=disease_col,
         process_mode=args.process_mode,
         pool_window=args.pool_window,
         pool_method=args.pool_method,
@@ -743,6 +781,7 @@ def main(args):
         collate_fn=custom_data_collator,
     )
 
+    # Gather labels for class weighting
     all_train_labels = [
         train_dataset[i]["label"].item() for i in range(len(train_dataset))
     ]
@@ -768,6 +807,7 @@ def main(args):
     print(f"History length (fixed): {history_length}")
     print(f"Number of input channels (observable features): {num_input_channels}")
 
+    # Model instantiation based on flags (unchanged)
     if args.gru:
         if args.attention:
             model = AKI_GRUClassifierWithAttention(
@@ -806,6 +846,10 @@ def main(args):
                 dropout=0.1,
                 use_layernorm=args.layernorm,
             ).to(device)
+
+    # Make sure the train_model function can access args.weight_decay
+    global args_for_train
+    args_for_train = args
 
     ckpt_folder = os.path.join(args.output_dir, run_name)
     os.makedirs(ckpt_folder, exist_ok=True)
@@ -935,7 +979,6 @@ if __name__ == "__main__":
         help="Directory to save model checkpoints.",
     )
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
-    # New flags for model variants
     parser.add_argument(
         "--attention",
         action="store_true",
@@ -952,6 +995,16 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Weight decay to use in the optimizer (default: 0, no weight decay).",
+    )
+
+    # New argument for disease
+    # Allowed: aki (default), af, pneumonia, pd, pod30
+    parser.add_argument(
+        "--disease",
+        type=str,
+        choices=["aki", "af", "pneumonia", "pd", "pod30"],
+        default="aki",
+        help="Which disease label to predict. Default: aki.",
     )
 
     args = parser.parse_args()
