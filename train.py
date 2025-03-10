@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 LSTM/GRU Classification for Disease Prediction via Recurrent Neural Networks
 
@@ -21,59 +22,6 @@ Usage Examples:
 Additional command-line options include specifying the pooling method, batch size,
 learning rate, number of epochs, and output directory for model checkpoints.
 For further customization, refer to the argument parser help message.
-
-    +------------------------------------------------------------------+
-    |           Raw CSV Files (per patient)                            |
-    |  - Each CSV contains a time series with 26 channels              |
-    |  - Patient ID is inferred from the filename (e.g., "R94657_...")   |
-    +------------------------------------------------------------------+
-                     │
-                     │  Preprocessing:
-                     │    - Add "time_idx" column (assumed 1 row/second)
-                     │    - (Optional) Pool over a 60-second window using a chosen method
-                     │    - Compute sequence lengths for all patients and set a cap at a given percentile
-                     │         (e.g., the 90th percentile of lengths becomes the fixed length)
-                     │    - Truncate sequences longer than the cap; pad shorter ones
-                     │    - Impute missing values with 0
-                     │    - (Optional) Normalize features (using training set statistics)
-                     │    - Attach disease label from an Excel file (column depends on chosen disease)
-                     │
-                     ▼
-    +---------------------------------------------------------------------+
-    |   Combined Preprocessed Data (Parquet file)                         |
-    |  Filename includes cap percentile (e.g., "preprocessed_90.parquet")   |
-    |  Columns: ID, <Disease>, time_idx, F1, F2, …, F26                    |
-    +---------------------------------------------------------------------+
-                     │
-                     │  Split by patient IDs into Train & Validation sets
-                     │
-                     ▼
-    +-----------------------------------------------+
-    |  PatientTimeSeriesDataset (Custom)            |
-    |  Each sample is a dict with:                  |
-    |    - time_series: [fixed_length, 26] tensor     |
-    |      (normalized and imputed)                 |
-    |    - label: scalar (<Disease> status)          |
-    +-----------------------------------------------+
-                     │
-                     ▼
-    +-----------------------------------------------+
-    |     DataLoader with custom collate_fn         |
-    +-----------------------------------------------+
-                     │
-                     ▼
-    +-----------------------------------------------+
-    |       Disease Recurrent Classifier Model      |
-    |  Options: LSTM/GRU, with or without attention,  |
-    |           optional layer normalization,       |
-    |           and bidirectional RNNs              |
-    |  Input: [batch, fixed_length, 26]  --> logits  |
-    +-----------------------------------------------+
-                     │
-                     ▼
-    +-----------------------------------------------+
-    |  Standard PyTorch Training Loop with wandb    |
-    +-----------------------------------------------+
 """
 
 __author__ = 'hw56@iu.edu'
@@ -114,7 +62,7 @@ DISEASE_MAP = {
 # Data Preprocessing Functions
 ##########################
 def pool_minute(df, pool_window=60, pool_method="average"):
-    exclude_cols = {"ID", "time_idx"}  # Exclude ID and time_idx; disease column handled separately
+    exclude_cols = {"ID", "time_idx"}
     feature_cols = [col for col in df.columns
                     if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
@@ -145,7 +93,6 @@ def pool_minute(df, pool_window=60, pool_method="average"):
         pooled_data.append(pooled_row)
     return pd.DataFrame(pooled_data)
 
-
 def truncate_pad_series(df, fixed_length, pad_value=0):
     current_length = len(df)
     if current_length >= fixed_length:
@@ -155,13 +102,12 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
         for col in ["ID"]:
             if col in df.columns:
                 pad_df[col] = df.iloc[0][col]
-        # Also replicate disease column if exists
+        # Replicate disease column if exists
         for col in df.columns:
             if col in DISEASE_MAP.values():
                 pad_df[col] = df.iloc[0][col]
         pad_df["time_idx"] = range(current_length, fixed_length)
         return pd.concat([df, pad_df], ignore_index=True)
-
 
 def compute_length_statistics(file_list, process_mode, pool_window, pool_method, label_dict, disease_col):
     lengths = []
@@ -254,16 +200,14 @@ class Attention(nn.Module):
         self.attn = nn.Linear(hidden_size, 1)
 
     def forward(self, rnn_outputs):
-        # rnn_outputs: [batch, time, hidden_size]
         attn_scores = self.attn(rnn_outputs)  # [batch, time, 1]
-        attn_weights = torch.softmax(attn_scores, dim=1)  # [batch, time, 1]
-        context = torch.sum(attn_weights * rnn_outputs, dim=1)  # [batch, hidden_size]
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        context = torch.sum(attn_weights * rnn_outputs, dim=1)
         return context, attn_weights
 
 ##########################
 # Model Variants
 ##########################
-# Disease LSTM Classifier
 class Disease_LSTMClassifier(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
                  dropout=0.1, use_layernorm=False, bidirectional=False):
@@ -312,8 +256,6 @@ class Disease_LSTMClassifier(nn.Module):
         h_last = self.dropout(h_last)
         return h_last
 
-
-# Disease LSTM Classifier with Attention
 class Disease_LSTMClassifierWithAttention(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
                  dropout=0.1, use_layernorm=False, bidirectional=False):
@@ -357,8 +299,6 @@ class Disease_LSTMClassifierWithAttention(nn.Module):
         context = self.dropout(context)
         return context
 
-
-# Disease GRU Classifier
 class Disease_GRUClassifier(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
                  dropout=0.1, use_layernorm=False, bidirectional=False):
@@ -407,8 +347,6 @@ class Disease_GRUClassifier(nn.Module):
         h_last = self.dropout(h_last)
         return h_last
 
-
-# Disease GRU Classifier with Attention
 class Disease_GRUClassifierWithAttention(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
                  dropout=0.1, use_layernorm=False, bidirectional=False):
@@ -473,13 +411,9 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80, leave=False):
             time_series = batch["time_series"].to(device)
             labels = batch["label"].to(device)
-
             optimizer.zero_grad()
-
             outputs = model(time_series)
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
-
-            # Use weighted cross-entropy loss unless disabled
             ce_weight = None if args.no_weighted_ce else class_weights.to(device)
             ce_loss = F.cross_entropy(logits, labels, weight=ce_weight)
 
@@ -583,7 +517,7 @@ def main(args):
     # decide which disease column to use
     disease_col = DISEASE_MAP[args.disease.lower()]
 
-    # create a run name for wandb and checkpoint folder
+    # Create run name for wandb and checkpoint folder
     model_type = "GRU" if args.gru else "LSTM"
     attn_str = "_ATTN" if args.attention else ""
     ln_str = "_LN" if args.layernorm else ""
@@ -611,7 +545,8 @@ def main(args):
         file_list = file_list[: args.max_patients]
     print(f"Found {len(file_list)} patient files.")
 
-    preprocessed_path = f"{args.preprocessed_path.split('.')[0]}_{args.cap_percentile}.parquet"
+    # Use a disease-specific preprocessed file name, e.g. "af_preprocessed.parquet"
+    preprocessed_path = f"{args.disease}_preprocessed.parquet"
     if os.path.exists(preprocessed_path):
         print(f"Loading preprocessed data from {preprocessed_path}...")
         all_patients_df = pd.read_parquet(preprocessed_path)
@@ -856,7 +791,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
                         help="Directory containing patient CSV files.")
     parser.add_argument("--preprocessed_path", type=str, default="preprocessed_data.parquet",
-                        help="Base path to save/load preprocessed data (will append cap percentile).")
+                        help="Base path to save/load preprocessed data (not used now; using disease-specific naming).")
     parser.add_argument("--process_mode", type=str, choices=["truncate", "pool", "none"],
                         default="pool", help="Preprocessing mode: 'pool' uses minute pooling; 'truncate' pads/truncates to fixed length.")
     parser.add_argument("--pool_window", type=int, default=60,
@@ -882,22 +817,22 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./lstm_checkpoints",
                         help="Directory to save model checkpoints.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
-    # New flags for model variants
+    # Model variant flags
     parser.add_argument("--attention", action="store_true", help="Use attention mechanism on top of the recurrent layer.")
     parser.add_argument("--gru", action="store_true", help="Use GRU instead of LSTM.")
     parser.add_argument("--layernorm", action="store_true", help="Enable layer normalization (default: disabled).")
     parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="Weight decay to use in the optimizer (default: 0, no weight decay).")
     parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional RNNs (default: disabled).")
-    # New argument for dropout rate
+    # Dropout rate argument
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate (default: 0.1).")
-    # New arguments for oversampling and triplet loss
+    # Oversampling and triplet loss
     parser.add_argument("--oversample", action="store_true", help="Use weighted random sampling to oversample the minority class.")
     parser.add_argument("--triplet_loss", action="store_true", help="Use triplet margin loss in addition to cross-entropy classification.")
     parser.add_argument("--triplet_margin", type=float, default=1.0, help="Margin for triplet margin loss (default: 1.0).")
-    # New argument to disable weighted CE loss (default: weighted CE enabled)
+    # Disable weighted CE loss flag
     parser.add_argument("--no_weighted_ce", action="store_true", help="Disable weighted class coefficient in cross-entropy loss.")
-    # New argument for disease
+    # Disease argument
     parser.add_argument("--disease", type=str, choices=["aki", "af", "pneumonia", "pd", "pod30"],
                         default="aki", help="Which disease label to predict. Default: aki.")
 
