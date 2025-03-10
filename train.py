@@ -7,8 +7,8 @@ or POD30 Death) from multi-channel patient vital signs data. The pipeline includ
 preprocessing patient CSV files, pooling/truncating time series to a fixed length,
 normalizing features based on training set statistics, and splitting data into training
 and validation sets. The model architecture includes residual connections, optional layer
-normalization, dropout, and optionally an attention mechanism on top of the recurrent layer.
-It also supports bidirectional RNNs.
+normalization, dropout, and optionally an attention mechanism on top of the recurrent
+layer. It also supports bidirectional RNNs.
 
 Usage Examples:
 
@@ -96,7 +96,7 @@ import wandb
 from sklearn.metrics import (accuracy_score, precision_recall_fscore_support,
                              roc_auc_score)
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 ##########################
@@ -115,10 +115,8 @@ DISEASE_MAP = {
 ##########################
 def pool_minute(df, pool_window=60, pool_method="average"):
     exclude_cols = {"ID", "time_idx"}  # Exclude ID and time_idx; disease column handled separately
-    feature_cols = [
-        col for col in df.columns
-        if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
-    ]
+    feature_cols = [col for col in df.columns
+                    if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
     pooled_data = []
     n = len(df)
     num_windows = int(np.ceil(n / pool_window))
@@ -153,9 +151,7 @@ def truncate_pad_series(df, fixed_length, pad_value=0):
     if current_length >= fixed_length:
         return df.iloc[:fixed_length].copy()
     else:
-        pad_df = pd.DataFrame(
-            pad_value, index=range(fixed_length - current_length), columns=df.columns
-        )
+        pad_df = pd.DataFrame(pad_value, index=range(fixed_length - current_length), columns=df.columns)
         for col in ["ID"]:
             if col in df.columns:
                 pad_df[col] = df.iloc[0][col]
@@ -193,19 +189,9 @@ def compute_length_statistics(file_list, process_mode, pool_window, pool_method,
 # Custom Dataset
 ##########################
 class PatientTimeSeriesDataset(Dataset):
-    def __init__(
-        self,
-        file_list,
-        label_dict,
-        disease_col,
-        fixed_length,
-        process_mode="pool",
-        pool_window=60,
-        pool_method="average",
-        normalize=False,
-        feature_means=None,
-        feature_stds=None,
-    ):
+    def __init__(self, file_list, label_dict, disease_col, fixed_length,
+                 process_mode="pool", pool_window=60, pool_method="average",
+                 normalize=False, feature_means=None, feature_stds=None):
         self.file_list = file_list
         self.label_dict = label_dict
         self.disease_col = disease_col
@@ -236,9 +222,8 @@ class PatientTimeSeriesDataset(Dataset):
         df = truncate_pad_series(df, fixed_length=self.fixed_length)
         df[self.disease_col] = df[self.disease_col].astype(np.int64)
         exclude_cols = {"ID", "time_idx", self.disease_col}
-        feature_cols = [
-            col for col in df.columns if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)
-        ]
+        feature_cols = [col for col in df.columns
+                        if col not in exclude_cols and np.issubdtype(df[col].dtype, np.number)]
         time_series = torch.tensor(df[feature_cols].values, dtype=torch.float)
         time_series = torch.nan_to_num(time_series, nan=0.0)
         if self.normalize and self.feature_means is not None and self.feature_stds is not None:
@@ -260,7 +245,6 @@ def custom_data_collator(features):
     print(f"[DEBUG] Collated batch keys: {list(batch.keys())}")
     return batch
 
-
 ##########################
 # Attention Module
 ##########################
@@ -276,27 +260,21 @@ class Attention(nn.Module):
         context = torch.sum(attn_weights * rnn_outputs, dim=1)  # [batch, hidden_size]
         return context, attn_weights
 
-
 ##########################
 # Model Variants
 ##########################
 # Disease LSTM Classifier
 class Disease_LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
+                 dropout=0.1, use_layernorm=False, bidirectional=False):
         super(Disease_LSTMClassifier, self).__init__()
         self.bidirectional = bidirectional
-        self.lstm = nn.LSTM(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                            bidirectional=bidirectional)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
         if self.use_layernorm:
-            # if bidirectional, layernorm operates on 2*hidden_size
             self.layernorm = nn.LayerNorm(hidden_size * 2 if bidirectional else hidden_size)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
@@ -306,7 +284,6 @@ class Disease_LSTMClassifier(nn.Module):
     def forward(self, x):
         out, (h_n, _) = self.lstm(x)
         if self.bidirectional:
-            # Concatenate the last forward and backward hidden states
             h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
         else:
             h_last = h_n[-1]
@@ -338,24 +315,19 @@ class Disease_LSTMClassifier(nn.Module):
 
 # Disease LSTM Classifier with Attention
 class Disease_LSTMClassifierWithAttention(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
+                 dropout=0.1, use_layernorm=False, bidirectional=False):
         super(Disease_LSTMClassifierWithAttention, self).__init__()
         self.bidirectional = bidirectional
-        self.lstm = nn.LSTM(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                            bidirectional=bidirectional)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
         out_dim = hidden_size * 2 if bidirectional else hidden_size
         if self.use_layernorm:
             self.layernorm = nn.LayerNorm(out_dim)
-        attn_dim = out_dim
-        self.attention = Attention(attn_dim)
+        self.attention = Attention(out_dim)
         self.activation = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(out_dim, num_classes)
@@ -388,17 +360,13 @@ class Disease_LSTMClassifierWithAttention(nn.Module):
 
 # Disease GRU Classifier
 class Disease_GRUClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
+                 dropout=0.1, use_layernorm=False, bidirectional=False):
         super(Disease_GRUClassifier, self).__init__()
         self.bidirectional = bidirectional
-        self.gru = nn.GRU(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers,
+                          batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                          bidirectional=bidirectional)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
         out_dim = hidden_size * 2 if bidirectional else hidden_size
@@ -442,17 +410,13 @@ class Disease_GRUClassifier(nn.Module):
 
 # Disease GRU Classifier with Attention
 class Disease_GRUClassifierWithAttention(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.1, use_layernorm=False, bidirectional=False):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2,
+                 dropout=0.1, use_layernorm=False, bidirectional=False):
         super(Disease_GRUClassifierWithAttention, self).__init__()
         self.bidirectional = bidirectional
-        self.gru = nn.GRU(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=num_layers,
+                          batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                          bidirectional=bidirectional)
         self.residual = nn.Linear(input_size, hidden_size) if input_size != hidden_size else None
         self.use_layernorm = use_layernorm
         out_dim = hidden_size * 2 if bidirectional else hidden_size
@@ -488,14 +452,16 @@ class Disease_GRUClassifierWithAttention(nn.Module):
         context = self.dropout(context)
         return context
 
+##########################
+# Training Loop with Early Stopping and Triplet Loss
+##########################
+from torch.nn import TripletMarginLoss
 
-##########################
-# Training Loop with Early Stopping
-##########################
 def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 class_weights, patience=5):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                   weight_decay=args.weight_decay)
+    triplet_criterion = TripletMarginLoss(margin=args.triplet_margin)
     best_val_loss = float('inf')
     best_val_f1 = 0.0
     best_model_state = None
@@ -504,14 +470,46 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80,
-                          leave=False):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80, leave=False):
             time_series = batch["time_series"].to(device)
             labels = batch["label"].to(device)
+
             optimizer.zero_grad()
+
             outputs = model(time_series)
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
-            loss = F.cross_entropy(logits, labels, weight=class_weights.to(device))
+
+            # Use weighted cross-entropy loss unless disabled
+            ce_weight = None if args.no_weighted_ce else class_weights.to(device)
+            ce_loss = F.cross_entropy(logits, labels, weight=ce_weight)
+
+            if args.triplet_loss:
+                embeddings = model.encode(time_series)
+                anchor_list, pos_list, neg_list = [], [], []
+                for i in range(len(labels)):
+                    anchor_label = labels[i].item()
+                    same_indices = (labels == anchor_label).nonzero(as_tuple=True)[0]
+                    diff_indices = (labels != anchor_label).nonzero(as_tuple=True)[0]
+                    if len(same_indices) < 2 or len(diff_indices) < 1:
+                        continue
+                    pos_idx = np.random.choice(same_indices.cpu().numpy())
+                    while pos_idx == i:
+                        pos_idx = np.random.choice(same_indices.cpu().numpy())
+                    neg_idx = np.random.choice(diff_indices.cpu().numpy())
+                    anchor_list.append(embeddings[i].unsqueeze(0))
+                    pos_list.append(embeddings[pos_idx].unsqueeze(0))
+                    neg_list.append(embeddings[neg_idx].unsqueeze(0))
+                if len(anchor_list) > 0:
+                    anchor_t = torch.cat(anchor_list, dim=0)
+                    pos_t = torch.cat(pos_list, dim=0)
+                    neg_t = torch.cat(neg_list, dim=0)
+                    tri_loss = triplet_criterion(anchor_t, pos_t, neg_t)
+                else:
+                    tri_loss = torch.tensor(0.0, device=device)
+                loss = ce_loss + tri_loss
+            else:
+                loss = ce_loss
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -523,14 +521,13 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         all_preds = []
         all_labels = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80,
-                              leave=False):
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80, leave=False):
                 time_series = batch["time_series"].to(device)
                 labels = batch["label"].to(device)
                 outputs = model(time_series)
                 logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                loss = F.cross_entropy(logits, labels, weight=class_weights.to(device))
-                val_losses.append(loss.item())
+                ce_loss = F.cross_entropy(logits, labels, weight=ce_weight)
+                val_losses.append(ce_loss.item())
                 preds = torch.argmax(logits, dim=-1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
@@ -540,19 +537,18 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
             auc = roc_auc_score(all_labels, all_preds)
         except Exception:
             auc = 0.5
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
-                                                                   all_preds,
-                                                                   average='binary',
-                                                                   zero_division=0)
-        print(
-            f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}"
-        )
-        wandb.log(
-            {"epoch": epoch, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
-             "accuracy": acc, "auc": auc, "f1": f1}
-        )
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds,
+                                                                   average='binary', zero_division=0)
+        print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "accuracy": acc,
+            "auc": auc,
+            "f1": f1
+        })
 
-        # early stopping check: if validation loss improves, save the model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_val_f1 = f1
@@ -561,15 +557,11 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         else:
             no_improvement_count += 1
             if no_improvement_count >= patience:
-                print(
-                    f"Early stopping triggered at epoch {epoch} after {patience} epochs with no improvement."
-                )
+                print(f"Early stopping triggered at epoch {epoch} after {patience} epochs with no improvement.")
                 break
-
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
     return model
-
 
 ##########################
 # Compute Normalization Statistics
@@ -583,7 +575,6 @@ def compute_normalization_stats(dataset):
     means = all_data.mean(dim=(0, 1))
     stds = all_data.std(dim=(0, 1))
     return means, stds
-
 
 ##########################
 # Main Function
@@ -600,23 +591,16 @@ def main(args):
     run_name = f"{args.disease.upper()}_{model_type}{attn_str}{ln_str}{bi_str}_lr{args.learning_rate}_ep{args.epochs}_dr{args.dropout}"
 
     wandb.init(project=args.disease.upper(), name=run_name, config=vars(args))
-    device = torch.device(
-        f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu"
-    )
+    device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
 
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels.drop_duplicates().dropna(subset=[disease_col, "ID"])
-    label_dict = {
-        str(x).strip(): int(y)
-        for x, y in zip(df_labels["ID"], df_labels[disease_col])
-    }
+    label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels[disease_col])}
 
-    file_list = [
-        os.path.join(args.data_dir, fname)
-        for fname in os.listdir(args.data_dir)
-        if fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict
-    ]
+    file_list = [os.path.join(args.data_dir, fname)
+                 for fname in os.listdir(args.data_dir)
+                 if fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict]
     if args.debug:
         file_list = file_list[: args.max_patients]
     print(f"Found {len(file_list)} patient files.")
@@ -630,12 +614,10 @@ def main(args):
         print("Label distribution:", dict(all_patients_df[disease_col].value_counts()))
         fixed_length = int(all_patients_df.groupby("ID").size().median())
     else:
-        lengths = compute_length_statistics(
-            file_list, args.process_mode, args.pool_window, args.pool_method, label_dict, disease_col
-        )
-        print(
-            f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}"
-        )
+        lengths = compute_length_statistics(file_list, args.process_mode,
+                                            args.pool_window, args.pool_method,
+                                            label_dict, disease_col)
+        print(f"Sequence length statistics: min={lengths.min()}, max={lengths.max()}, mean={lengths.mean():.2f}, median={np.median(lengths):.2f}")
         cap_length = int(np.percentile(lengths, args.cap_percentile))
         print(f"Using cap percentile {args.cap_percentile} => fixed sequence length = {cap_length}")
         processed_samples = []
@@ -671,24 +653,14 @@ def main(args):
 
     unique_ids = all_patients_df["ID"].unique()
     labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
-    train_ids, val_ids = train_test_split(
-        unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split
-    )
+    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split)
     train_df = all_patients_df[all_patients_df["ID"].isin(train_ids)]
     val_df = all_patients_df[all_patients_df["ID"].isin(val_ids)]
-    print(
-        f"Training label distribution (from data): {dict(train_df[disease_col].value_counts())}"
-    )
-    print(
-        f"Validation label distribution (from data): {dict(val_df[disease_col].value_counts())}"
-    )
+    print(f"Training label distribution (from data): {dict(train_df[disease_col].value_counts())}")
+    print(f"Validation label distribution (from data): {dict(val_df[disease_col].value_counts())}")
 
     train_dataset = PatientTimeSeriesDataset(
-        file_list=[
-            f
-            for f in file_list
-            if os.path.basename(f).split("_")[0].strip() in train_ids
-        ],
+        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in train_ids],
         label_dict=label_dict,
         disease_col=disease_col,
         process_mode=args.process_mode,
@@ -698,9 +670,7 @@ def main(args):
         normalize=False,
     )
     val_dataset = PatientTimeSeriesDataset(
-        file_list=[
-            f for f in file_list if os.path.basename(f).split("_")[0].strip() in val_ids
-        ],
+        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in val_ids],
         label_dict=label_dict,
         disease_col=disease_col,
         process_mode=args.process_mode,
@@ -740,13 +710,30 @@ def main(args):
         print("[DEBUG] Sample time_series shape:", sample["time_series"].shape)
         print("[DEBUG] Sample label:", sample["label"].item())
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=custom_data_collator,
-    )
+    all_train_labels = [train_dataset[i]["label"].item() for i in range(len(train_dataset))]
+    if args.oversample:
+        print("[DEBUG] Using oversampling (WeightedRandomSampler).")
+        labels_np = np.array(all_train_labels)
+        unique_labels, counts = np.unique(labels_np, return_counts=True)
+        weights = np.zeros_like(labels_np, dtype=np.float32)
+        for ul, c in zip(unique_labels, counts):
+            weights[labels_np == ul] = 1.0 / c
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(labels_np), replacement=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            collate_fn=custom_data_collator,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=custom_data_collator,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -755,9 +742,6 @@ def main(args):
         collate_fn=custom_data_collator,
     )
 
-    all_train_labels = [
-        train_dataset[i]["label"].item() for i in range(len(train_dataset))
-    ]
     print("Training label distribution (dataset):", dict(Counter(all_train_labels)))
 
     def compute_class_weights(labels):
@@ -768,9 +752,7 @@ def main(args):
             return torch.tensor([1.0, 1.0], dtype=torch.float)
         weights = n_samples / (n_classes * counts)
         weight_dict = {int(k): w for k, w in zip(unique, counts)}
-        return torch.tensor(
-            [weight_dict.get(i, 1.0) for i in range(2)], dtype=torch.float
-        )
+        return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)], dtype=torch.float)
 
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
@@ -845,10 +827,7 @@ def main(args):
             time_series = batch["time_series"].to(device)
             labels = batch["label"].to(device)
             outputs = model(time_series)
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
             preds = torch.argmax(logits, dim=-1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -865,129 +844,56 @@ def main(args):
     wandb.log({"final_accuracy": acc, "final_auc": auc, "checkpoint_path": model_path})
     return model
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # data parameters
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="time_series_data_LSTM_10_29_2024",
-        help="Directory containing patient CSV files.",
-    )
-    parser.add_argument(
-        "--preprocessed_path",
-        type=str,
-        default="preprocessed_data.parquet",
-        help="Base path to save/load preprocessed data (will append cap percentile).",
-    )
-    parser.add_argument(
-        "--process_mode",
-        type=str,
-        choices=["truncate", "pool", "none"],
-        default="pool",
-        help="Preprocessing mode: 'pool' uses minute pooling; 'truncate' pads/truncates to fixed length.",
-    )
-    parser.add_argument(
-        "--pool_window",
-        type=int,
-        default=60,
-        help="Window size (in seconds) for pooling.",
-    )
-    parser.add_argument(
-        "--pool_method",
-        type=str,
-        choices=["average", "max", "median"],
-        default="average",
-        help="Pooling method for minute pooling.",
-    )
-    parser.add_argument(
-        "--cap_percentile",
-        type=float,
-        default=90,
-        help="Cap percentile to determine fixed sequence length from the distribution of sequence lengths.",
-    )
+    parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
+                        help="Directory containing patient CSV files.")
+    parser.add_argument("--preprocessed_path", type=str, default="preprocessed_data.parquet",
+                        help="Base path to save/load preprocessed data (will append cap percentile).")
+    parser.add_argument("--process_mode", type=str, choices=["truncate", "pool", "none"],
+                        default="pool", help="Preprocessing mode: 'pool' uses minute pooling; 'truncate' pads/truncates to fixed length.")
+    parser.add_argument("--pool_window", type=int, default=60,
+                        help="Window size (in seconds) for pooling.")
+    parser.add_argument("--pool_method", type=str, choices=["average", "max", "median"],
+                        default="average", help="Pooling method for minute pooling.")
+    parser.add_argument("--cap_percentile", type=float, default=90,
+                        help="Cap percentile to determine fixed sequence length from the distribution of sequence lengths.")
     # training parameters
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-5,
-        help="Learning rate.",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="Number of worker processes for DataLoader.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=5,
-        help="Number of epochs with no improvement on validation loss before early stopping.",
-    )
+    parser.add_argument("--learning_rate", type=float, default=1e-5,
+                        help="Learning rate.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Number of worker processes for DataLoader.")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Number of epochs with no improvement on validation loss before early stopping.")
     # hardware & debug options
     parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
-    parser.add_argument(
-        "--no_cuda", action="store_true", help="Disable CUDA even if available."
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Debug mode: process fewer patients and print extra info.",
-    )
-    parser.add_argument(
-        "--max_patients",
-        type=int,
-        default=100,
-        help="Max patients to process in debug mode.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./lstm_checkpoints",
-        help="Directory to save model checkpoints.",
-    )
+    parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: process fewer patients and print extra info.")
+    parser.add_argument("--max_patients", type=int, default=100, help="Max patients to process in debug mode.")
+    parser.add_argument("--output_dir", type=str, default="./lstm_checkpoints",
+                        help="Directory to save model checkpoints.")
     parser.add_argument("--no_save", action="store_true", help="Disable model saving.")
     # New flags for model variants
-    parser.add_argument(
-        "--attention",
-        action="store_true",
-        help="Use attention mechanism on top of the recurrent layer.",
-    )
+    parser.add_argument("--attention", action="store_true", help="Use attention mechanism on top of the recurrent layer.")
     parser.add_argument("--gru", action="store_true", help="Use GRU instead of LSTM.")
-    parser.add_argument(
-        "--layernorm",
-        action="store_true",
-        help="Enable layer normalization (default: disabled).",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.0,
-        help="Weight decay to use in the optimizer (default: 0, no weight decay).",
-    )
-    parser.add_argument(
-        "--bidirectional",
-        action="store_true",
-        help="Use bidirectional RNNs (default: disabled).",
-    )
+    parser.add_argument("--layernorm", action="store_true", help="Enable layer normalization (default: disabled).")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="Weight decay to use in the optimizer (default: 0, no weight decay).")
+    parser.add_argument("--bidirectional", action="store_true", help="Use bidirectional RNNs (default: disabled).")
+    # New argument for dropout rate
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate (default: 0.1).")
+    # New arguments for oversampling and triplet loss
+    parser.add_argument("--oversample", action="store_true", help="Use weighted random sampling to oversample the minority class.")
+    parser.add_argument("--triplet_loss", action="store_true", help="Use triplet margin loss in addition to cross-entropy classification.")
+    parser.add_argument("--triplet_margin", type=float, default=1.0, help="Margin for triplet margin loss (default: 1.0).")
+    # New argument to disable weighted CE loss (default: weighted CE enabled)
+    parser.add_argument("--no_weighted_ce", action="store_true", help="Disable weighted class coefficient in cross-entropy loss.")
     # New argument for disease
-    parser.add_argument(
-        "--disease",
-        type=str,
-        choices=["aki", "af", "pneumonia", "pd", "pod30"],
-        default="aki",
-        help="Which disease label to predict. Default: aki.",
-    )
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.1,
-        help="Dropout rate (default: 0.1).",
-    )
+    parser.add_argument("--disease", type=str, choices=["aki", "af", "pneumonia", "pd", "pod30"],
+                        default="aki", help="Which disease label to predict. Default: aki.")
 
     args = parser.parse_args()
     main(args)
