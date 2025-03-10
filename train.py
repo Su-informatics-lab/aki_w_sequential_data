@@ -599,7 +599,7 @@ def main(args):
     bi_str = "_BI" if args.bidirectional else ""
     run_name = f"{args.disease.upper()}_{model_type}{attn_str}{ln_str}{bi_str}_lr{args.learning_rate}_ep{args.epochs}_dr{args.dropout}"
 
-    wandb.init(project="AKI_LSTM", name=run_name, config=vars(args))
+    wandb.init(project=args.disease.upper(), name=run_name, config=vars(args))
     device = torch.device(
         f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu"
     )
