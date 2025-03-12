@@ -17,18 +17,18 @@ module load CUDA/12.2.0
 
 
 # Train baseline for Acute Kidney Injury (AKI)
-python train.py --disease aki &
+python train_cnn.py --disease aki &
 
 # Train baseline for Atrial Fibrillation (AF)
-python train.py --disease af &
+python train_cnn.py --disease af &
 
 # Train baseline for Pneumonia
-python train.py --disease pneumonia &
+python train_cnn.py --disease pneumonia &
 
 # Train baseline for Postoperative Delirium (PD)
-python train.py --disease pd &
+python train_cnn.py --disease pd &
 
 # Train baseline for POD30 Death
-python train.py --disease pod30 &
+python train_cnn.py --disease pod30 &
 
 wait
