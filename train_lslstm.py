@@ -24,6 +24,7 @@ import argparse
 import os
 import pickle
 from collections import Counter
+from torch.optim.lr_scheduler import StepLR
 
 import numpy as np
 import pandas as pd
@@ -272,7 +273,9 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 class_weights, patience=5, args=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                   weight_decay=args.weight_decay if args else 0.0)
-    triplet_criterion = TripletMarginLoss(margin=args.triplet_margin if args else 1.0)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=args.lr_gamma)
+    triplet_criterion = torch.nn.TripletMarginLoss(
+        margin=args.triplet_margin if args else 1.0)
     best_val_loss = float('inf')
     best_val_f1 = 0.0
     best_model_state = None
@@ -281,7 +284,8 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80, leave=False):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch} Training", ncols=80,
+                          leave=False):
             intra_tensor = batch["intra_tensor"].to(device)
             preop = batch["preop"].to(device)
             labels = batch["label"].to(device)
@@ -289,7 +293,8 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
             outputs = model(intra_tensor, preop)
             logits = outputs
             # Use vanilla cross-entropy by default; if --weighted_ce is provided, then apply class weights.
-            ce_weight = class_weights.to(device) if (args and args.weighted_ce) else None
+            ce_weight = class_weights.to(device) if (
+                        args and args.weighted_ce) else None
             ce_loss = F.cross_entropy(logits, labels, weight=ce_weight)
 
             if args and args.triplet_loss:
@@ -325,12 +330,16 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
             train_losses.append(loss.item())
         avg_train_loss = np.mean(train_losses)
 
+        # Step the learning rate scheduler at the end of the epoch
+        scheduler.step()
+
         model.eval()
         val_losses = []
         all_preds = []
         all_labels = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80, leave=False):
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80,
+                              leave=False):
                 intra_tensor = batch["intra_tensor"].to(device)
                 preop = batch["preop"].to(device)
                 labels = batch["label"].to(device)
@@ -347,16 +356,20 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
             auc = roc_auc_score(all_labels, all_preds)
         except Exception:
             auc = 0.5
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds,
-                                                                   average='binary', zero_division=0)
-        print(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
+        precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
+                                                                   all_preds,
+                                                                   average='binary',
+                                                                   zero_division=0)
+        print(
+            f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
         wandb.log({
             "epoch": epoch,
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
             "accuracy": acc,
             "auc": auc,
-            "f1": f1
+            "f1": f1,
+            "learning_rate": scheduler.get_last_lr()[0]
         })
 
         if avg_val_loss < best_val_loss:
@@ -367,7 +380,8 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         else:
             no_improvement_count += 1
             if no_improvement_count >= patience:
-                print(f"Early stopping triggered at epoch {epoch} after {patience} epochs with no improvement.")
+                print(
+                    f"Early stopping triggered at epoch {epoch} after {patience} epochs with no improvement.")
                 break
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -614,10 +628,12 @@ if __name__ == "__main__":
     parser.add_argument("--process_mode", type=str, choices=["lslstm", "pool", "truncate", "none"],
                         default="lslstm", help="Preprocessing mode: 'lslstm' uses the segmentation strategy from the paper.")
     # training parameters
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-5,
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
                         help="Learning rate.")
+    parser.add_argument("--lr_gamma", type=float, default=0.97,
+                        help="Learning rate's decay rate.")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of worker processes for DataLoader.")
     parser.add_argument("--patience", type=int, default=5,
