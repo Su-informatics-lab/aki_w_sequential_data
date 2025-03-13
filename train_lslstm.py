@@ -623,7 +623,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # data parameters
-    parser.add_argument("--data_dir", type=str, default="time_series_data_LSLSTM",
+    parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
                         help="Directory containing patient CSV files.")
     parser.add_argument("--process_mode", type=str, choices=["lslstm", "pool", "truncate", "none"],
                         default="lslstm", help="Preprocessing mode: 'lslstm' uses the segmentation strategy from the paper.")
