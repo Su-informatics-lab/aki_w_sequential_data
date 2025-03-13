@@ -160,23 +160,36 @@ class PatientTimeSeriesDataset(Dataset):
         df["ID"] = patient_id
         if patient_id not in self.label_dict:
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
-        # Ensure the disease column is present
         if self.disease_col not in df.columns:
             df[self.disease_col] = int(self.label_dict[patient_id])
-        # Preprocess intraoperative data:
+        # Preprocess intraoperative data
         df = impute_intraoperative(df)
-        intra_df = df[[col for col in INTRA_FEATURES if col in df.columns]].copy()
-        intra_array = intra_df.values.astype(np.float32)
+        # Select intraoperative columns that remain from INTRA_FEATURES
+        intra_cols = [col for col in INTRA_FEATURES if col in df.columns]
+        if len(intra_cols) == 0:
+            # If no expected intraoperative columns exist, create a dummy array with zeros.
+            # Expected shape: (number_of_time_steps, 28)
+            dummy = np.zeros((df.shape[0], len(INTRA_FEATURES)), dtype=np.float32)
+            intra_array = dummy
+        else:
+            intra_array = df[intra_cols].values.astype(np.float32)
+            # If fewer than expected columns are present, pad with zeros to reach 28.
+            if intra_array.shape[1] < len(INTRA_FEATURES):
+                pad_width = len(INTRA_FEATURES) - intra_array.shape[1]
+                intra_array = np.concatenate([intra_array, np.zeros(
+                    (intra_array.shape[0], pad_width), dtype=np.float32)], axis=1)
         intra_array = np.nan_to_num(intra_array, nan=0.0)
         intra_array = pad_or_truncate_series(intra_array, self.intra_target_length)
         intra_tensor = segment_intraoperative(intra_array, seg_length=self.seg_length,
                                               hop_size=self.hop_size,
-                                              pad_front=self.pad_front, pad_back=self.pad_back,
+                                              pad_front=self.pad_front,
+                                              pad_back=self.pad_back,
                                               num_segments=150)
         intra_tensor = torch.tensor(intra_tensor, dtype=torch.float)
         if self.normalize and self.intra_feature_means is not None and self.intra_feature_stds is not None:
-            intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1, 1)) / (self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
-        # Preoperative data:
+            intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1, 1)) / (
+                        self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
+        # Preoperative data
         preop_df = df[[col for col in PREOP_FEATURES if col in df.columns]].copy()
         preop_array = preop_df.values.astype(np.float32)
         for j in range(preop_array.shape[1]):
@@ -187,9 +200,11 @@ class PatientTimeSeriesDataset(Dataset):
                 preop_array[:, j] = col_vals
         preop_vector = torch.tensor(preop_array.mean(axis=0), dtype=torch.float)
         if self.normalize and self.preop_feature_means is not None and self.preop_feature_stds is not None:
-            preop_vector = (preop_vector - self.preop_feature_means) / (self.preop_feature_stds + 1e-8)
+            preop_vector = (preop_vector - self.preop_feature_means) / (
+                        self.preop_feature_stds + 1e-8)
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"intra_tensor": intra_tensor, "preop": preop_vector, "label": label}
+
 
 ##########################
 # Custom Data Collator (updated to handle both intra and preop inputs)
