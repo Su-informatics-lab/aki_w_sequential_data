@@ -387,6 +387,18 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 loss = ce_loss
 
             loss.backward()
+
+            # Check gradient norms
+            grad_norms = []
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    norm = param.grad.data.norm(2).item()
+                    grad_norms.append(norm)
+                    # Optionally, print per parameter gradient norm:
+                    # print(f"Grad norm for {name}: {norm:.4f}")
+            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+            print(f"Epoch {epoch}: Average Grad Norm = {avg_grad_norm:.4f}")
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_losses.append(loss.item())
