@@ -406,18 +406,23 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 preop = batch["preop"].to(device)
                 labels = batch["label"].to(device)
                 outputs = model(intra_tensor, preop)
-                logits = outputs
-                ce_loss = F.cross_entropy(logits, labels, weight=ce_weight)
+
+                # Convert logits to probabilities for the positive class
+                probs = F.softmax(outputs, dim=1)[:, 1]
+
+                ce_loss = F.cross_entropy(outputs, labels, weight=ce_weight)
                 val_losses.append(ce_loss.item())
-                preds = torch.argmax(logits, dim=-1)
-                all_preds.extend(preds.cpu().numpy())
+
+                # For accuracy, still use argmax if needed
+                preds = torch.argmax(outputs, dim=-1)
+                all_preds.extend(
+                    probs.cpu().numpy())  # use probabilities for AUC calculation
                 all_labels.extend(labels.cpu().numpy())
-        avg_val_loss = np.mean(val_losses)
-        acc = accuracy_score(all_labels, all_preds)
-        try:
-            auc = roc_auc_score(all_labels, all_preds)
-        except Exception:
-            auc = 0.5
+        # try:
+        auc = roc_auc_score(all_labels, all_preds)
+        # except Exception:
+        #     auc = 0.5
+
         precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
                                                                    all_preds,
                                                                    average='binary',
