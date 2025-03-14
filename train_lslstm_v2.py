@@ -628,11 +628,11 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         acc = accuracy_score(all_labels, all_preds)
 
         # Calculate AUC (safely)
-        try:
-            auc = roc_auc_score(all_labels, all_probs)
-        except Exception as e:
-            print(f"[WARNING] AUC calculation error: {e}. Using default value of 0.5.")
-            auc = 0.5
+        # try:
+        auc = roc_auc_score(all_labels, all_probs)
+        # except Exception as e:
+        #     print(f"[WARNING] AUC calculation error: {e}. Using default value of 0.5.")
+        #     auc = 0.5
 
         # Calculate precision, recall, f1 using binary predictions
         precision, recall, f1, _ = precision_recall_fscore_support(
