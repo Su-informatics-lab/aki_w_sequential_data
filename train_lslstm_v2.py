@@ -12,6 +12,10 @@ This version implements the preprocessing and LS-LSTM model as described in the 
 - The LS-LSTM model first extracts local features per segment via a bidirectional LSTM,
   then applies an inter-sequence LSTM to obtain a latent representation, which is fused with the preoperative vector.
 - The training/dev split is 80/20.
+
+Usage:
+python train_lslstm_v2.py --disease aki --patience 50 --learning_rate 5e-4 --weighted_c --focal_loss
+
 """
 
 __author__ = 'hw56@iu.edu_improved'
@@ -569,7 +573,7 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
                 max_grad_norm = np.max(grad_norms) if grad_norms else 0.0
 
-                print(f"Epoch {epoch}: Average Grad Norm = {avg_grad_norm:.4f}, Max Grad Norm = {max_grad_norm:.4f}")
+                # print(f"Epoch {epoch}: Average Grad Norm = {avg_grad_norm:.4f}, Max Grad Norm = {max_grad_norm:.4f}")
                 wandb.log({
                     "avg_grad_norm": avg_grad_norm,
                     "max_grad_norm": max_grad_norm
