@@ -396,33 +396,33 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         scheduler.step()
 
         model.eval()
-        val_losses = []
-        all_preds = []
+        all_probs = []  # For AUC calculation
+        all_preds = []  # For binary classification metrics
         all_labels = []
+
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch} Validation", ncols=80,
-                              leave=False):
+            for batch in tqdm(val_loader, desc="Validation", ncols=80, leave=False):
                 intra_tensor = batch["intra_tensor"].to(device)
                 preop = batch["preop"].to(device)
                 labels = batch["label"].to(device)
                 outputs = model(intra_tensor, preop)
 
-                # Convert logits to probabilities for the positive class
+                # Get probability for the positive class
                 probs = F.softmax(outputs, dim=1)[:, 1]
+                # Get binary predictions
+                preds = torch.argmax(outputs, dim=1)
 
-                ce_loss = F.cross_entropy(outputs, labels, weight=ce_weight)
-                val_losses.append(ce_loss.item())
-
-                # For accuracy, still use argmax if needed
-                preds = torch.argmax(outputs, dim=-1)
-                all_preds.extend(
-                    probs.cpu().numpy())  # use probabilities for AUC calculation
+                all_probs.extend(probs.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-        # try:
-        auc = roc_auc_score(all_labels, all_preds)
-        # except Exception:
-        #     auc = 0.5
 
+        # Calculate AUC using continuous probabilities
+        try:
+            auc = roc_auc_score(all_labels, all_probs)
+        except Exception:
+            auc = 0.5
+
+        # Calculate precision, recall, f1 using binary predictions
         precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
                                                                    all_preds,
                                                                    average='binary',
