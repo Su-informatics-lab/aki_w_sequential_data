@@ -449,51 +449,7 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         model.load_state_dict(best_model_state)
     return model
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # data parameters
-    parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
-                        help="Directory containing patient CSV files.")
-    parser.add_argument("--process_mode", type=str, choices=["lslstm", "pool", "truncate", "none"],
-                        default="lslstm", help="Preprocessing mode: 'lslstm' uses the segmentation strategy from the paper.")
-    parser.add_argument("--max_drop_rate", type=float, default=0.1,
-                        help="Maximum rate of abnormal values before dropping a feature column (default: 0.1).")
-    # training parameters
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-3,
-                        help="Learning rate.")
-    parser.add_argument("--lr_gamma", type=float, default=0.97,
-                        help="Learning rate's decay rate.")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of worker processes for DataLoader.")
-    parser.add_argument("--patience", type=int, default=5,
-                        help="Number of epochs with no improvement on validation loss before early stopping.")
-    # hardware & debug options
-    parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
-    parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
-    parser.add_argument("--debug", action="store_true", help="Debug mode: process fewer patients and print extra info.")
-    parser.add_argument("--max_patients", type=int, default=100, help="Max patients to process in debug mode.")
-    parser.add_argument("--output_dir", type=str, default="./lslstm_checkpoints",
-                        help="Directory to save model checkpoints.")
-    # Model variant flags
-    parser.add_argument("--oversample", action="store_true", help="Use weighted random sampling to oversample the minority class.")
-    parser.add_argument("--triplet_loss", action="store_true", help="Use triplet margin loss in addition to cross-entropy classification.")
-    parser.add_argument("--triplet_margin", type=float, default=1.0, help="Margin for triplet margin loss (default: 1.0).")
-    # Use vanilla cross-entropy by default; if --weighted_ce is provided, then weighted cross-entropy is used.
-    parser.add_argument("--weighted_ce", action="store_true", help="Enable weighted cross-entropy loss (default: disabled).")
-    parser.add_argument("--weight_decay", type=float, default=0.0,
-                        help="Weight decay to use in the optimizer (default: 0, no weight decay).")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate (default: 0.1).")
-    # Disease argument
-    parser.add_argument("--disease", type=str, choices=["aki", "af", "pneumonia", "pd", "pod30"],
-                        default="aki", help="Which disease label to predict. Default: aki.")
-    # New arguments related to debugging and normalization
-    parser.add_argument("--recompute_stats", action="store_true",
-                        help="Force recomputation of normalization statistics even if a stats file exists.")
 
-    args = parser.parse_args()
-    main(args)
 
 ##########################
 # Functions to compute normalization statistics for both intra and preop data.
