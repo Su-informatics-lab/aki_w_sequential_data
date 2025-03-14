@@ -6,7 +6,7 @@ This version implements the preprocessing and LS-LSTM model as described in the 
 - Intraoperative data (28 indicators) are truncated/padded to 18,000 seconds, then additionally
   padded with 90 zeros at the start and end. They are segmented into overlapping chunks
   (segment length = 180, hop size = 120) to yield a tensor of shape (28, 180, 150).
-- Missing/inconsistent intraoperative values (<=0) are imputed with the patient’s mean.
+- Missing/inconsistent intraoperative values (<=0) are imputed with the patient's mean.
 - Preoperative data (80 variables) are assumed to be present.
 - Both intraoperative and preoperative features are standardized.
 - The LS-LSTM model first extracts local features per segment via a bidirectional LSTM,
@@ -171,6 +171,9 @@ class PatientTimeSeriesDataset(Dataset):
         return len(self.file_list)
 
     def __getitem__(self, idx):
+        """
+        Enhanced __getitem__ method to handle missing features safely.
+        """
         csv_path = self.file_list[idx]
         fname = os.path.basename(csv_path)
         patient_id = fname.split("_")[0].strip()
@@ -215,13 +218,11 @@ class PatientTimeSeriesDataset(Dataset):
         if self.normalize and self.intra_feature_means is not None and self.intra_feature_stds is not None:
             # Check if dimensions match before applying normalization
             if self.intra_feature_means.size(0) == intra_tensor.size(0):
-                intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1,
-                                                                             1)) / (
-                                       self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
+                intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1, 1)) / (
+                            self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
             else:
-                print(
-                    f"[WARNING] Dimension mismatch: intra_tensor has {intra_tensor.size(0)} features, "
-                    f"but means has {self.intra_feature_means.size(0)} features. Skipping normalization.")
+                print(f"[WARNING] Dimension mismatch: intra_tensor has {intra_tensor.size(0)} features, "
+                      f"but means has {self.intra_feature_means.size(0)} features. Skipping normalization.")
 
         # Preoperative data
         preop_cols = [col for col in PREOP_FEATURES if col in df.columns]
@@ -229,16 +230,14 @@ class PatientTimeSeriesDataset(Dataset):
             preop_vector = torch.zeros(len(PREOP_FEATURES), dtype=torch.float)
         else:
             preop_df = df[preop_cols].copy()
-            preop_array = np.zeros((preop_df.shape[0], len(PREOP_FEATURES)),
-                                   dtype=np.float32)
+            preop_array = np.zeros((preop_df.shape[0], len(PREOP_FEATURES)), dtype=np.float32)
 
             # Fill in available preoperative features
             for i, col in enumerate(PREOP_FEATURES):
                 if col in preop_df.columns:
                     col_vals = preop_df[col].values.astype(np.float32)
                     if np.isnan(col_vals).any():
-                        mean_val = np.nanmean(col_vals) if not np.isnan(
-                            np.nanmean(col_vals)) else 0.0
+                        mean_val = np.nanmean(col_vals) if not np.isnan(np.nanmean(col_vals)) else 0.0
                         col_vals[np.isnan(col_vals)] = mean_val
                     preop_array[:, i] = col_vals
 
@@ -248,7 +247,7 @@ class PatientTimeSeriesDataset(Dataset):
         if self.normalize and self.preop_feature_means is not None and self.preop_feature_stds is not None:
             if self.preop_feature_means.size(0) == preop_vector.size(0):
                 preop_vector = (preop_vector - self.preop_feature_means) / (
-                        self.preop_feature_stds + 1e-8)
+                            self.preop_feature_stds + 1e-8)
 
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"intra_tensor": intra_tensor, "preop": preop_vector, "label": label}
@@ -450,6 +449,52 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         model.load_state_dict(best_model_state)
     return model
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # data parameters
+    parser.add_argument("--data_dir", type=str, default="time_series_data_LSTM_10_29_2024",
+                        help="Directory containing patient CSV files.")
+    parser.add_argument("--process_mode", type=str, choices=["lslstm", "pool", "truncate", "none"],
+                        default="lslstm", help="Preprocessing mode: 'lslstm' uses the segmentation strategy from the paper.")
+    parser.add_argument("--max_drop_rate", type=float, default=0.1,
+                        help="Maximum rate of abnormal values before dropping a feature column (default: 0.1).")
+    # training parameters
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Learning rate.")
+    parser.add_argument("--lr_gamma", type=float, default=0.97,
+                        help="Learning rate's decay rate.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Number of worker processes for DataLoader.")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Number of epochs with no improvement on validation loss before early stopping.")
+    # hardware & debug options
+    parser.add_argument("--cuda", type=int, default=0, help="GPU device index to use.")
+    parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA even if available.")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: process fewer patients and print extra info.")
+    parser.add_argument("--max_patients", type=int, default=100, help="Max patients to process in debug mode.")
+    parser.add_argument("--output_dir", type=str, default="./lslstm_checkpoints",
+                        help="Directory to save model checkpoints.")
+    # Model variant flags
+    parser.add_argument("--oversample", action="store_true", help="Use weighted random sampling to oversample the minority class.")
+    parser.add_argument("--triplet_loss", action="store_true", help="Use triplet margin loss in addition to cross-entropy classification.")
+    parser.add_argument("--triplet_margin", type=float, default=1.0, help="Margin for triplet margin loss (default: 1.0).")
+    # Use vanilla cross-entropy by default; if --weighted_ce is provided, then weighted cross-entropy is used.
+    parser.add_argument("--weighted_ce", action="store_true", help="Enable weighted cross-entropy loss (default: disabled).")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="Weight decay to use in the optimizer (default: 0, no weight decay).")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate (default: 0.1).")
+    # Disease argument
+    parser.add_argument("--disease", type=str, choices=["aki", "af", "pneumonia", "pd", "pod30"],
+                        default="aki", help="Which disease label to predict. Default: aki.")
+    # New arguments related to debugging and normalization
+    parser.add_argument("--recompute_stats", action="store_true",
+                        help="Force recomputation of normalization statistics even if a stats file exists.")
+
+    args = parser.parse_args()
+    main(args)
+
 ##########################
 # Functions to compute normalization statistics for both intra and preop data.
 ##########################
@@ -507,14 +552,12 @@ def compute_normalization_stats(dataset, key, feature_dim=None):
             stds = all_data.std(dim=0)
             stds[stds == 0] = 1.0
 
-        print(
-            f"Computed {key} stats - means shape: {means.shape}, stds shape: {stds.shape}")
+        print(f"Computed {key} stats - means shape: {means.shape}, stds shape: {stds.shape}")
 
         # Ensure correct dimensions if specified
         if feature_dim is not None:
             if means.size(0) != feature_dim:
-                print(
-                    f"[WARNING] Expected {feature_dim} features for {key}, but got {means.size(0)}. Padding.")
+                print(f"[WARNING] Expected {feature_dim} features for {key}, but got {means.size(0)}. Padding.")
                 if means.size(0) < feature_dim:
                     # Pad with zeros/ones if fewer features than expected
                     means = torch.cat([means, torch.zeros(feature_dim - means.size(0))])
@@ -564,13 +607,11 @@ def load_or_compute_norm_stats(args, train_dataset):
             # Verify dimensions
             if (intra_means.size(0) != len(INTRA_FEATURES) or
                     preop_means.size(0) != len(PREOP_FEATURES)):
-                print(
-                    "[WARNING] Loaded stats have incorrect dimensions. Recomputing...")
+                print("[WARNING] Loaded stats have incorrect dimensions. Recomputing...")
                 force_recompute = True
             else:
                 print(f"[INFO] Loaded normalization stats from {norm_stats_file}")
-                print(
-                    f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
+                print(f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
                 return intra_means, intra_stds, preop_means, preop_stds
 
         except Exception as e:
@@ -597,8 +638,7 @@ def load_or_compute_norm_stats(args, train_dataset):
         pickle.dump(stats, f)
 
     print(f"[INFO] Saved normalization stats to {norm_stats_file}")
-    print(
-        f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
+    print(f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
 
     return intra_means, intra_stds, preop_means, preop_stds
 
@@ -618,20 +658,17 @@ def main(args):
         run_name += f"_wd{args.weight_decay}"
 
     wandb.init(project=args.disease.upper(), name=run_name, config=vars(args))
-    device = torch.device(
-        f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
 
     # Load label file
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels.drop_duplicates().dropna(subset=[disease_col, "ID"])
-    label_dict = {str(x).strip(): int(y) for x, y in
-                  zip(df_labels["ID"], df_labels[disease_col])}
+    label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels[disease_col])}
 
     file_list = [os.path.join(args.data_dir, fname)
                  for fname in os.listdir(args.data_dir)
-                 if
-                 fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict]
+                 if fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict]
     if args.debug:
         file_list = file_list[: args.max_patients]
     print(f"Found {len(file_list)} patient files.")
@@ -651,14 +688,12 @@ def main(args):
             continue
         df["ID"] = patient_id
         if patient_id not in label_dict:
-            print(
-                f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
+            print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
             continue
         if disease_col not in df.columns:
             df[disease_col] = int(label_dict[patient_id])
         # Use the improved impute_intraoperative function
-        df = impute_intraoperative(df, max_drop_rate=args.max_drop_rate,
-                                   verbose=args.debug)
+        df = impute_intraoperative(df, max_drop_rate=args.max_drop_rate, verbose=args.debug)
         processed_samples.append(df)
 
     if len(processed_samples) == 0:
@@ -672,18 +707,12 @@ def main(args):
     # 80/20 Training/Validation split by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
-    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42,
-                                          stratify=labels_for_split)
+    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split)
     print(f"Training patients: {len(train_ids)}, Validation patients: {len(val_ids)}")
 
-    # Create datasets with custom __getitem__ implementation
-    class ImprovedPatientTimeSeriesDataset(PatientTimeSeriesDataset):
-        def __getitem__(self, idx):
-            return dataset_getitem(self, idx)
-
-    train_dataset = ImprovedPatientTimeSeriesDataset(
-        file_list=[f for f in file_list if
-                   os.path.basename(f).split("_")[0].strip() in train_ids],
+    # Use the PatientTimeSeriesDataset directly (no custom __getitem__ needed as we updated it in the class)
+    train_dataset = PatientTimeSeriesDataset(
+        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in train_ids],
         label_dict=label_dict,
         disease_col=disease_col,
         intra_target_length=intra_target_length,
@@ -691,9 +720,8 @@ def main(args):
         normalize=False,
     )
 
-    val_dataset = ImprovedPatientTimeSeriesDataset(
-        file_list=[f for f in file_list if
-                   os.path.basename(f).split("_")[0].strip() in val_ids],
+    val_dataset = PatientTimeSeriesDataset(
+        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in val_ids],
         label_dict=label_dict,
         disease_col=disease_col,
         intra_target_length=intra_target_length,
@@ -702,8 +730,7 @@ def main(args):
     )
 
     # Use the improved normalization stats loader
-    intra_means, intra_stds, preop_means, preop_stds = load_or_compute_norm_stats(args,
-                                                                                  train_dataset)
+    intra_means, intra_stds, preop_means, preop_stds = load_or_compute_norm_stats(args, train_dataset)
 
     train_dataset.normalize = True
     train_dataset.intra_feature_means = intra_means
@@ -719,8 +746,7 @@ def main(args):
 
     # Now safely get all training labels
     all_train_labels = []
-    for i in tqdm(range(len(train_dataset)), desc="Collecting training labels",
-                  ncols=80):
+    for i in tqdm(range(len(train_dataset)), desc="Collecting training labels", ncols=80):
         try:
             label = train_dataset[i]["label"].item()
             all_train_labels.append(label)
@@ -736,8 +762,7 @@ def main(args):
         weights = np.zeros_like(labels_np, dtype=np.float32)
         for ul, c in zip(unique_labels, counts):
             weights[labels_np == ul] = 1.0 / c
-        train_sampler = WeightedRandomSampler(weights, num_samples=len(labels_np),
-                                              replacement=True)
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(labels_np), replacement=True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
@@ -768,10 +793,8 @@ def main(args):
         if n_classes < 2:
             return torch.tensor([1.0, 1.0], dtype=torch.float)
         weights = n_samples / (n_classes * counts)
-        weight_dict = {int(k): v for k, v in zip(unique,
-                                                 weights)}  # Fixed: was using counts instead of weights
-        return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)],
-                            dtype=torch.float)
+        weight_dict = {int(k): v for k, v in zip(unique, weights)}  # Fixed: was using counts instead of weights
+        return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)], dtype=torch.float)
 
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
@@ -830,6 +853,7 @@ def main(args):
     print(f"Model saved to {model_path}")
     wandb.log({"final_accuracy": acc, "final_auc": auc, "checkpoint_path": model_path})
     return model
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
