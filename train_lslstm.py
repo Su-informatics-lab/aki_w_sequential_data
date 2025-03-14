@@ -821,7 +821,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_drop_rate", type=float, default=0.1,
                         help="Maximum rate of abnormal values before dropping a feature column (default: 0.1).")
     # training parameters
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-3,
                         help="Learning rate.")
