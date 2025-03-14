@@ -347,9 +347,12 @@ class LS_LSTMClassifier(nn.Module):
                 if 'lstm' in name:
                     # LSTM weights benefit from orthogonal initialization
                     nn.init.orthogonal_(param)
-                else:
-                    # Linear layers use Kaiming initialization
+                elif len(param.shape) >= 2:
+                    # Linear layers use Kaiming initialization (only for tensors with at least 2 dims)
                     nn.init.kaiming_normal_(param, nonlinearity='relu')
+                else:
+                    # For 1D parameters (like some batch norm weights)
+                    nn.init.normal_(param, mean=0.0, std=0.01)
             elif 'bias' in name:
                 nn.init.zeros_(param)
 
