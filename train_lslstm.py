@@ -62,26 +62,47 @@ PREOP_FEATURES = [f"preop_{i}" for i in range(1, 81)]
 ##########################
 # New Preprocessing Functions for LS-LSTM
 ##########################
-def impute_intraoperative(df):
+def impute_intraoperative(df, max_drop_rate=0.1, verbose=True):
     """
-    For each intraoperative indicator, replace values <= 0 with the patient’s mean for that indicator.
-    Optionally, drop an indicator if >10% of its values are abnormal.
+    For each intraoperative indicator, replace values <= 0 with the patient's mean for that indicator.
+    Only drop an indicator if >max_drop_rate of its values are abnormal.
+
+    Parameters:
+    df (pandas.DataFrame): DataFrame containing patient data
+    max_drop_rate (float): Maximum acceptable rate of abnormal values before dropping a column
+    verbose (bool): Whether to print debug messages
+
+    Returns:
+    pandas.DataFrame: DataFrame with imputed values
     """
+    dropped_cols = []
     for col in INTRA_FEATURES:
         if col not in df.columns:
             continue
         # Flag abnormal values (<= 0)
         abnormal_mask = df[col] <= 0
         abnormal_rate = abnormal_mask.mean()
-        if abnormal_rate > 0.10:
+        if abnormal_rate > max_drop_rate:
             # Drop the column entirely if too many abnormal values.
             df.drop(columns=[col], inplace=True)
-            print(f"[DEBUG] Dropped {col} due to abnormal rate {abnormal_rate:.2f}")
+            dropped_cols.append(col)
+            if verbose:
+                print(f"[DEBUG] Dropped {col} due to abnormal rate {abnormal_rate:.2f}")
         else:
             if abnormal_mask.any():
-                # Impute with the patient’s mean (computed ignoring abnormal values)
-                valid_mean = df.loc[~abnormal_mask, col].mean()
-                df.loc[abnormal_mask, col] = valid_mean
+                # Impute with the patient's mean (computed ignoring abnormal values)
+                valid_values = df.loc[~abnormal_mask, col]
+                if len(valid_values) > 0:
+                    valid_mean = valid_values.mean()
+                    df.loc[abnormal_mask, col] = valid_mean
+                else:
+                    # If all values are abnormal, use global mean or 0
+                    df.loc[abnormal_mask, col] = 0  # or some other reasonable default
+
+    if verbose and dropped_cols:
+        print(
+            f"[WARNING] Dropped {len(dropped_cols)} columns due to high abnormal rates: {dropped_cols}")
+
     return df
 
 def pad_or_truncate_series(series, target_length):
@@ -162,23 +183,26 @@ class PatientTimeSeriesDataset(Dataset):
             raise KeyError(f"Patient ID {patient_id} not found in label mapping.")
         if self.disease_col not in df.columns:
             df[self.disease_col] = int(self.label_dict[patient_id])
+
         # Preprocess intraoperative data
-        df = impute_intraoperative(df)
+        df = impute_intraoperative(df, verbose=False)
+
         # Select intraoperative columns that remain from INTRA_FEATURES
         intra_cols = [col for col in INTRA_FEATURES if col in df.columns]
-        if len(intra_cols) == 0:
-            # If no expected intraoperative columns exist, create a dummy array with zeros.
-            # Expected shape: (number_of_time_steps, 28)
-            dummy = np.zeros((df.shape[0], len(INTRA_FEATURES)), dtype=np.float32)
-            intra_array = dummy
-        else:
-            intra_array = df[intra_cols].values.astype(np.float32)
-            # If fewer than expected columns are present, pad with zeros to reach 28.
-            if intra_array.shape[1] < len(INTRA_FEATURES):
-                pad_width = len(INTRA_FEATURES) - intra_array.shape[1]
-                intra_array = np.concatenate([intra_array, np.zeros(
-                    (intra_array.shape[0], pad_width), dtype=np.float32)], axis=1)
+
+        # Always create a fixed-size array with all expected features
+        intra_array = np.zeros((df.shape[0], len(INTRA_FEATURES)), dtype=np.float32)
+
+        # Fill in available features
+        if len(intra_cols) > 0:
+            for i, col in enumerate(INTRA_FEATURES):
+                if col in df.columns:
+                    intra_array[:, i] = df[col].values.astype(np.float32)
+
+        # Handle NaN values
         intra_array = np.nan_to_num(intra_array, nan=0.0)
+
+        # Further processing
         intra_array = pad_or_truncate_series(intra_array, self.intra_target_length)
         intra_tensor = segment_intraoperative(intra_array, seg_length=self.seg_length,
                                               hop_size=self.hop_size,
@@ -186,22 +210,46 @@ class PatientTimeSeriesDataset(Dataset):
                                               pad_back=self.pad_back,
                                               num_segments=150)
         intra_tensor = torch.tensor(intra_tensor, dtype=torch.float)
+
+        # Apply normalization if needed
         if self.normalize and self.intra_feature_means is not None and self.intra_feature_stds is not None:
-            intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1, 1)) / (
-                        self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
+            # Check if dimensions match before applying normalization
+            if self.intra_feature_means.size(0) == intra_tensor.size(0):
+                intra_tensor = (intra_tensor - self.intra_feature_means.view(-1, 1,
+                                                                             1)) / (
+                                       self.intra_feature_stds.view(-1, 1, 1) + 1e-8)
+            else:
+                print(
+                    f"[WARNING] Dimension mismatch: intra_tensor has {intra_tensor.size(0)} features, "
+                    f"but means has {self.intra_feature_means.size(0)} features. Skipping normalization.")
+
         # Preoperative data
-        preop_df = df[[col for col in PREOP_FEATURES if col in df.columns]].copy()
-        preop_array = preop_df.values.astype(np.float32)
-        for j in range(preop_array.shape[1]):
-            col_vals = preop_array[:, j]
-            if np.isnan(col_vals).any():
-                mean_val = np.nanmean(col_vals)
-                col_vals[np.isnan(col_vals)] = mean_val
-                preop_array[:, j] = col_vals
-        preop_vector = torch.tensor(preop_array.mean(axis=0), dtype=torch.float)
+        preop_cols = [col for col in PREOP_FEATURES if col in df.columns]
+        if len(preop_cols) == 0:
+            preop_vector = torch.zeros(len(PREOP_FEATURES), dtype=torch.float)
+        else:
+            preop_df = df[preop_cols].copy()
+            preop_array = np.zeros((preop_df.shape[0], len(PREOP_FEATURES)),
+                                   dtype=np.float32)
+
+            # Fill in available preoperative features
+            for i, col in enumerate(PREOP_FEATURES):
+                if col in preop_df.columns:
+                    col_vals = preop_df[col].values.astype(np.float32)
+                    if np.isnan(col_vals).any():
+                        mean_val = np.nanmean(col_vals) if not np.isnan(
+                            np.nanmean(col_vals)) else 0.0
+                        col_vals[np.isnan(col_vals)] = mean_val
+                    preop_array[:, i] = col_vals
+
+            preop_vector = torch.tensor(preop_array.mean(axis=0), dtype=torch.float)
+
+        # Apply normalization for preoperative data if needed
         if self.normalize and self.preop_feature_means is not None and self.preop_feature_stds is not None:
-            preop_vector = (preop_vector - self.preop_feature_means) / (
+            if self.preop_feature_means.size(0) == preop_vector.size(0):
+                preop_vector = (preop_vector - self.preop_feature_means) / (
                         self.preop_feature_stds + 1e-8)
+
         label = torch.tensor(int(self.label_dict[patient_id]), dtype=torch.long)
         return {"intra_tensor": intra_tensor, "preop": preop_vector, "label": label}
 
@@ -405,20 +453,154 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
 ##########################
 # Functions to compute normalization statistics for both intra and preop data.
 ##########################
-def compute_normalization_stats(dataset, key):
-    # key: "intra_tensor" or "preop"
+def compute_normalization_stats(dataset, key, feature_dim=None):
+    """
+    Compute normalization statistics (mean and standard deviation) for the given dataset and key.
+
+    Parameters:
+    dataset: The dataset to compute statistics for
+    key: Either "intra_tensor" or "preop"
+    feature_dim: Expected feature dimension (default: None)
+
+    Returns:
+    means, stds: Tensors containing means and standard deviations
+    """
+    print(f"Computing normalization stats for {key}")
+
+    # Use a small subset for initial computation to check dimensions
+    try:
+        sample_idx = min(10, len(dataset) - 1)
+        sample = dataset[sample_idx][key]
+        print(f"Sample {key} shape: {sample.shape}")
+    except Exception as e:
+        print(f"[WARNING] Error checking sample shape: {e}")
+
     all_data = []
     for i in tqdm(range(len(dataset)), desc=f"Computing normalization stats for {key}"):
-        sample = dataset[i][key]
-        all_data.append(sample)
-    all_data = torch.stack(all_data, dim=0)
-    if key == "intra_tensor":
-        means = all_data.mean(dim=(0,2,3))
-        stds = all_data.std(dim=(0,2,3))
-    else:
-        means = all_data.mean(dim=0)
-        stds = all_data.std(dim=0)
-    return means, stds
+        try:
+            sample = dataset[i][key]
+            all_data.append(sample)
+        except Exception as e:
+            print(f"[WARNING] Error in sample {i}: {e}")
+            continue
+
+    if len(all_data) == 0:
+        print(f"[ERROR] No valid samples found for {key}")
+        # Return default values
+        if key == "intra_tensor":
+            return torch.zeros(28), torch.ones(28)
+        else:
+            return torch.zeros(80), torch.ones(80)
+
+    try:
+        all_data = torch.stack(all_data, dim=0)
+        print(f"Stacked {key} data shape: {all_data.shape}")
+
+        if key == "intra_tensor":
+            # For intra_tensor: (batch, features, seg_length, num_segments)
+            means = all_data.mean(dim=(0, 2, 3))
+            stds = all_data.std(dim=(0, 2, 3))
+            stds[stds == 0] = 1.0  # Replace zero stds with 1 to avoid division by zero
+        else:
+            # For preop: (batch, features)
+            means = all_data.mean(dim=0)
+            stds = all_data.std(dim=0)
+            stds[stds == 0] = 1.0
+
+        print(
+            f"Computed {key} stats - means shape: {means.shape}, stds shape: {stds.shape}")
+
+        # Ensure correct dimensions if specified
+        if feature_dim is not None:
+            if means.size(0) != feature_dim:
+                print(
+                    f"[WARNING] Expected {feature_dim} features for {key}, but got {means.size(0)}. Padding.")
+                if means.size(0) < feature_dim:
+                    # Pad with zeros/ones if fewer features than expected
+                    means = torch.cat([means, torch.zeros(feature_dim - means.size(0))])
+                    stds = torch.cat([stds, torch.ones(feature_dim - stds.size(0))])
+                else:
+                    # Truncate if more features than expected
+                    means = means[:feature_dim]
+                    stds = stds[:feature_dim]
+
+        return means, stds
+
+    except Exception as e:
+        print(f"[ERROR] Failed to compute statistics: {e}")
+        # Return default values
+        if key == "intra_tensor":
+            return torch.zeros(28), torch.ones(28)
+        else:
+            return torch.zeros(80), torch.ones(80)
+
+
+def load_or_compute_norm_stats(args, train_dataset):
+    """
+    Load normalization statistics from file or compute them if not available.
+
+    Parameters:
+    args: Command line arguments
+    train_dataset: Training dataset
+
+    Returns:
+    intra_means, intra_stds, preop_means, preop_stds: Normalization statistics
+    """
+    norm_stats_file = os.path.join(args.output_dir, "normalization_stats.pkl")
+
+    # Option to force recomputation
+    force_recompute = not os.path.exists(norm_stats_file) or args.recompute_stats
+
+    if not force_recompute:
+        try:
+            with open(norm_stats_file, "rb") as f:
+                stats = pickle.load(f)
+
+            intra_means = stats["intra_means"]
+            intra_stds = stats["intra_stds"]
+            preop_means = stats["preop_means"]
+            preop_stds = stats["preop_stds"]
+
+            # Verify dimensions
+            if (intra_means.size(0) != len(INTRA_FEATURES) or
+                    preop_means.size(0) != len(PREOP_FEATURES)):
+                print(
+                    "[WARNING] Loaded stats have incorrect dimensions. Recomputing...")
+                force_recompute = True
+            else:
+                print(f"[INFO] Loaded normalization stats from {norm_stats_file}")
+                print(
+                    f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
+                return intra_means, intra_stds, preop_means, preop_stds
+
+        except Exception as e:
+            print(f"[WARNING] Failed to load normalization stats: {e}. Recomputing...")
+            force_recompute = True
+
+    # Compute statistics
+    print("[INFO] Computing normalization statistics...")
+    intra_means, intra_stds = compute_normalization_stats(
+        train_dataset, key="intra_tensor", feature_dim=len(INTRA_FEATURES))
+    preop_means, preop_stds = compute_normalization_stats(
+        train_dataset, key="preop", feature_dim=len(PREOP_FEATURES))
+
+    # Save statistics
+    stats = {
+        "intra_means": intra_means,
+        "intra_stds": intra_stds,
+        "preop_means": preop_means,
+        "preop_stds": preop_stds
+    }
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(norm_stats_file, "wb") as f:
+        pickle.dump(stats, f)
+
+    print(f"[INFO] Saved normalization stats to {norm_stats_file}")
+    print(
+        f"[INFO] Intra means shape: {intra_means.shape}, Preop means shape: {preop_means.shape}")
+
+    return intra_means, intra_stds, preop_means, preop_stds
 
 ##########################
 # Main Function (Modified to use LS-LSTM preprocessing and model)
@@ -436,17 +618,20 @@ def main(args):
         run_name += f"_wd{args.weight_decay}"
 
     wandb.init(project=args.disease.upper(), name=run_name, config=vars(args))
-    device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    device = torch.device(
+        f"cuda:{args.cuda}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     print(f"Using device: {device}")
 
     # Load label file
     df_labels = pd.read_excel("imputed_demo_data.xlsx")
     df_labels = df_labels.drop_duplicates().dropna(subset=[disease_col, "ID"])
-    label_dict = {str(x).strip(): int(y) for x, y in zip(df_labels["ID"], df_labels[disease_col])}
+    label_dict = {str(x).strip(): int(y) for x, y in
+                  zip(df_labels["ID"], df_labels[disease_col])}
 
     file_list = [os.path.join(args.data_dir, fname)
                  for fname in os.listdir(args.data_dir)
-                 if fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict]
+                 if
+                 fname.endswith(".csv") and fname.split("_")[0].strip() in label_dict]
     if args.debug:
         file_list = file_list[: args.max_patients]
     print(f"Found {len(file_list)} patient files.")
@@ -466,14 +651,19 @@ def main(args):
             continue
         df["ID"] = patient_id
         if patient_id not in label_dict:
-            print(f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
+            print(
+                f"[WARNING] Patient ID {patient_id} not found in label mapping; skipping.")
             continue
         if disease_col not in df.columns:
             df[disease_col] = int(label_dict[patient_id])
-        df = impute_intraoperative(df)
+        # Use the improved impute_intraoperative function
+        df = impute_intraoperative(df, max_drop_rate=args.max_drop_rate,
+                                   verbose=args.debug)
         processed_samples.append(df)
+
     if len(processed_samples) == 0:
         raise ValueError("No patient files processed successfully.")
+
     all_patients_df = pd.concat(processed_samples, ignore_index=True)
     preprocessed_path = f"{args.disease}_preprocessed.parquet"
     pq.write_table(pa.Table.from_pandas(all_patients_df), preprocessed_path)
@@ -482,19 +672,18 @@ def main(args):
     # 80/20 Training/Validation split by patient ID.
     unique_ids = all_patients_df["ID"].unique()
     labels_for_split = [label_dict[str(pid).strip()] for pid in unique_ids]
-    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42, stratify=labels_for_split)
+    train_ids, val_ids = train_test_split(unique_ids, test_size=0.2, random_state=42,
+                                          stratify=labels_for_split)
     print(f"Training patients: {len(train_ids)}, Validation patients: {len(val_ids)}")
 
-    train_dataset = PatientTimeSeriesDataset(
-        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in train_ids],
-        label_dict=label_dict,
-        disease_col=disease_col,
-        intra_target_length=intra_target_length,
-        process_mode="lslstm",
-        normalize=False,
-    )
-    val_dataset = PatientTimeSeriesDataset(
-        file_list=[f for f in file_list if os.path.basename(f).split("_")[0].strip() in val_ids],
+    # Create datasets with custom __getitem__ implementation
+    class ImprovedPatientTimeSeriesDataset(PatientTimeSeriesDataset):
+        def __getitem__(self, idx):
+            return dataset_getitem(self, idx)
+
+    train_dataset = ImprovedPatientTimeSeriesDataset(
+        file_list=[f for f in file_list if
+                   os.path.basename(f).split("_")[0].strip() in train_ids],
         label_dict=label_dict,
         disease_col=disease_col,
         intra_target_length=intra_target_length,
@@ -502,24 +691,19 @@ def main(args):
         normalize=False,
     )
 
-    norm_stats_file = os.path.join(args.output_dir, "normalization_stats.pkl")
-    if os.path.exists(norm_stats_file):
-        with open(norm_stats_file, "rb") as f:
-            stats = pickle.load(f)
-        intra_means = stats["intra_means"]
-        intra_stds = stats["intra_stds"]
-        preop_means = stats["preop_means"]
-        preop_stds = stats["preop_stds"]
-        print(f"[DEBUG] Loaded normalization stats from {norm_stats_file}")
-    else:
-        intra_means, intra_stds = compute_normalization_stats(train_dataset, key="intra_tensor")
-        preop_means, preop_stds = compute_normalization_stats(train_dataset, key="preop")
-        stats = {"intra_means": intra_means, "intra_stds": intra_stds,
-                 "preop_means": preop_means, "preop_stds": preop_stds}
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(norm_stats_file, "wb") as f:
-            pickle.dump(stats, f)
-        print(f"[DEBUG] Saved normalization stats to {norm_stats_file}")
+    val_dataset = ImprovedPatientTimeSeriesDataset(
+        file_list=[f for f in file_list if
+                   os.path.basename(f).split("_")[0].strip() in val_ids],
+        label_dict=label_dict,
+        disease_col=disease_col,
+        intra_target_length=intra_target_length,
+        process_mode="lslstm",
+        normalize=False,
+    )
+
+    # Use the improved normalization stats loader
+    intra_means, intra_stds, preop_means, preop_stds = load_or_compute_norm_stats(args,
+                                                                                  train_dataset)
 
     train_dataset.normalize = True
     train_dataset.intra_feature_means = intra_means
@@ -533,7 +717,18 @@ def main(args):
     val_dataset.preop_feature_means = preop_means
     val_dataset.preop_feature_stds = preop_stds
 
-    all_train_labels = [train_dataset[i]["label"].item() for i in range(len(train_dataset))]
+    # Now safely get all training labels
+    all_train_labels = []
+    for i in tqdm(range(len(train_dataset)), desc="Collecting training labels",
+                  ncols=80):
+        try:
+            label = train_dataset[i]["label"].item()
+            all_train_labels.append(label)
+        except Exception as e:
+            print(f"[WARNING] Error getting label for sample {i}: {e}")
+
+    print("Training label distribution (dataset):", dict(Counter(all_train_labels)))
+
     if args.oversample:
         print("[DEBUG] Using oversampling (WeightedRandomSampler).")
         labels_np = np.array(all_train_labels)
@@ -541,7 +736,8 @@ def main(args):
         weights = np.zeros_like(labels_np, dtype=np.float32)
         for ul, c in zip(unique_labels, counts):
             weights[labels_np == ul] = 1.0 / c
-        train_sampler = WeightedRandomSampler(weights, num_samples=len(labels_np), replacement=True)
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(labels_np),
+                                              replacement=True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
@@ -565,8 +761,6 @@ def main(args):
         collate_fn=custom_data_collator,
     )
 
-    print("Training label distribution (dataset):", dict(Counter(all_train_labels)))
-
     def compute_class_weights(labels):
         unique, counts = np.unique(labels, return_counts=True)
         n_samples = len(labels)
@@ -574,8 +768,10 @@ def main(args):
         if n_classes < 2:
             return torch.tensor([1.0, 1.0], dtype=torch.float)
         weights = n_samples / (n_classes * counts)
-        weight_dict = {int(k): w for k, w in zip(unique, counts)}
-        return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)], dtype=torch.float)
+        weight_dict = {int(k): v for k, v in zip(unique,
+                                                 weights)}  # Fixed: was using counts instead of weights
+        return torch.tensor([weight_dict.get(i, 1.0) for i in range(2)],
+                            dtype=torch.float)
 
     class_weights = compute_class_weights(all_train_labels).to(device)
     print("Computed class weights (inverse frequency):", class_weights)
@@ -642,6 +838,8 @@ if __name__ == "__main__":
                         help="Directory containing patient CSV files.")
     parser.add_argument("--process_mode", type=str, choices=["lslstm", "pool", "truncate", "none"],
                         default="lslstm", help="Preprocessing mode: 'lslstm' uses the segmentation strategy from the paper.")
+    parser.add_argument("--max_drop_rate", type=float, default=0.1,
+                        help="Maximum rate of abnormal values before dropping a feature column (default: 0.1).")
     # training parameters
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
@@ -672,6 +870,9 @@ if __name__ == "__main__":
     # Disease argument
     parser.add_argument("--disease", type=str, choices=["aki", "af", "pneumonia", "pd", "pod30"],
                         default="aki", help="Which disease label to predict. Default: aki.")
+    # New arguments related to debugging and normalization
+    parser.add_argument("--recompute_stats", action="store_true",
+                        help="Force recomputation of normalization statistics even if a stats file exists.")
 
     args = parser.parse_args()
     main(args)
