@@ -396,6 +396,7 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
         scheduler.step()
 
         model.eval()
+        val_losses = []
         all_probs = []  # For AUC calculation
         all_preds = []  # For binary classification metrics
         all_labels = []
@@ -407,6 +408,10 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 labels = batch["label"].to(device)
                 outputs = model(intra_tensor, preop)
 
+                # Compute cross-entropy loss for validation
+                ce_loss = F.cross_entropy(outputs, labels, weight=ce_weight)
+                val_losses.append(ce_loss.item())
+
                 # Get probability for the positive class
                 probs = F.softmax(outputs, dim=1)[:, 1]
                 # Get binary predictions
@@ -416,19 +421,24 @@ def train_model(model, train_loader, val_loader, device, epochs, learning_rate,
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
-        # Calculate AUC using continuous probabilities
+        # Calculate average validation loss
+        avg_val_loss = np.mean(val_losses)
+        acc = accuracy_score(all_labels, all_preds)
         try:
             auc = roc_auc_score(all_labels, all_probs)
         except Exception:
             auc = 0.5
 
         # Calculate precision, recall, f1 using binary predictions
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels,
-                                                                   all_preds,
-                                                                   average='binary',
-                                                                   zero_division=0)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels, all_preds, average='binary', zero_division=0
+        )
+
         print(
-            f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}")
+            f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}, "
+            f"Acc = {acc:.4f}, AUC = {auc:.4f}, F1 = {f1:.4f}"
+        )
+
         wandb.log({
             "epoch": epoch,
             "train_loss": avg_train_loss,
